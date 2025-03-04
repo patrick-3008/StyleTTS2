@@ -254,10 +254,11 @@ def main(config_path):
                 text_mask = length_to_mask(input_lengths).to(texts.device)
 
                 # compute reference styles
-                if multispeaker and epoch >= diff_epoch:
-                    ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
-                    ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
-                    ref = torch.cat([ref_ss, ref_sp], dim=1)
+                if multispeaker and epoch >= diff_epoch: 
+                    # TODO: it is starnge that we do batch computation for reference audio here while we don't do it for actual sample audio, given the avgpool layer in style encoders.
+                    ref_acoustic_style_encoded = model.style_encoder(ref_mels.unsqueeze(1))
+                    ref_prosodic_style_encoded = model.predictor_encoder(ref_mels.unsqueeze(1))
+                    ref_style_encoded = torch.cat([ref_acoustic_style_encoded, ref_prosodic_style_encoded], dim=1)
                 
             try:
                 _, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
@@ -271,31 +272,29 @@ def main(config_path):
             s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
 
             # encode
-            t_en = model.text_encoder(texts, input_lengths, text_mask)
+            text_encoded = model.text_encoder(texts, input_lengths, text_mask)
             
             # 50% of chance of using monotonic version
             if bool(random.getrandbits(1)):
-                asr = (t_en @ s2s_attn)
+                aligned_encoded_text = (text_encoded @ s2s_attn)
             else:
-                asr = (t_en @ s2s_attn_mono)
+                aligned_encoded_text = (text_encoded @ s2s_attn_mono)
 
-            d_gt = s2s_attn_mono.sum(axis=-1).detach()
+            ground_truth_duration = s2s_attn_mono.sum(axis=-1).detach()
 
             # compute the style of the entire utterance
             # this operation cannot be done in batch because of the avgpool layer (may need to work on masked avgpool)
-            ss = []
-            gs = []
+            prosodic_style = []
+            acoustic_style = []
             for bib in range(len(mel_input_length)):
                 mel_length = int(mel_input_length[bib].item())
                 mel = mels[bib, :, :mel_input_length[bib]]
-                s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
-                ss.append(s)
-                s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
-                gs.append(s)
+                prosodic_style.append(model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1)))
+                acoustic_style.append(model.style_encoder(mel.unsqueeze(0).unsqueeze(1)))
 
-            s_dur = torch.stack(ss).squeeze()  # global prosodic styles
-            gs = torch.stack(gs).squeeze() # global acoustic styles
-            s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
+            prosodic_style = torch.stack(prosodic_style).squeeze()  # global prosodic styles
+            acoustic_style = torch.stack(acoustic_style).squeeze() # global acoustic styles
+            style_trg = torch.cat([acoustic_style, prosodic_style], dim=-1).detach() # ground truth for denoiser
 
             bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
             d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
@@ -305,26 +304,26 @@ def main(config_path):
                 num_steps = np.random.randint(3, 5)
                 
                 if model_params.diffusion.dist.estimate_sigma_data:
-                    model.diffusion.module.diffusion.sigma_data = s_trg.std(axis=-1).mean().item() # batch-wise std estimation
+                    model.diffusion.module.diffusion.sigma_data = style_trg.std(axis=-1).mean().item() # batch-wise std estimation
                     running_std.append(model.diffusion.module.diffusion.sigma_data)
                     
                 if multispeaker:
-                    s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
+                    s_preds = sampler(noise = torch.randn_like(style_trg).unsqueeze(1).to(device), 
                           embedding=bert_dur,
                           embedding_scale=1,
-                                   features=ref, # reference from the same speaker as the embedding
+                                   features=ref_style_encoded, # reference from the same speaker as the embedding
                              embedding_mask_proba=0.1,
                              num_steps=num_steps).squeeze(1)
-                    loss_diff = model.diffusion(s_trg.unsqueeze(1), embedding=bert_dur, features=ref).mean() # EDM loss
-                    loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
+                    loss_diff = model.diffusion(style_trg.unsqueeze(1), embedding=bert_dur, features=ref_style_encoded).mean() # EDM loss
+                    loss_sty = F.l1_loss(s_preds, style_trg.detach()) # style reconstruction loss
                 else:
-                    s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
+                    s_preds = sampler(noise = torch.randn_like(style_trg).unsqueeze(1).to(device), 
                           embedding=bert_dur,
                           embedding_scale=1,
                              embedding_mask_proba=0.1,
                              num_steps=num_steps).squeeze(1)                    
-                    loss_diff = model.diffusion.module.diffusion(s_trg.unsqueeze(1), embedding=bert_dur).mean() # EDM loss
-                    loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
+                    loss_diff = model.diffusion.module.diffusion(style_trg.unsqueeze(1), embedding=bert_dur).mean() # EDM loss
+                    loss_sty = F.l1_loss(s_preds, style_trg.detach()) # style reconstruction loss
             else:
                 loss_sty = 0
                 loss_diff = 0
@@ -332,11 +331,8 @@ def main(config_path):
             s_loss = 0
             
 
-            d, p = model.predictor(d_en, s_dur, 
-                                                    input_lengths, 
-                                                    s2s_attn_mono, 
-                                                    text_mask)
-                
+            d, p = model.predictor(d_en, prosodic_style, input_lengths, s2s_attn_mono, text_mask)
+
             mel_len_st = int(mel_input_length.min().item() / 2 - 1)
             mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
             en = []
@@ -349,7 +345,7 @@ def main(config_path):
                 mel_length = int(mel_input_length[bib].item() / 2)
 
                 random_start = np.random.randint(0, mel_length - mel_len)
-                en.append(asr[bib, :, random_start:random_start+mel_len])
+                en.append(aligned_encoded_text[bib, :, random_start:random_start+mel_len])
                 p_en.append(p[bib, :, random_start:random_start+mel_len])
                 gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
                 
@@ -371,8 +367,8 @@ def main(config_path):
             if gt.size(-1) < 80:
                 continue
             
-            s = model.style_encoder(gt.unsqueeze(1))           
-            s_dur = model.predictor_encoder(gt.unsqueeze(1))
+            acoustic_style = model.style_encoder(gt.unsqueeze(1))           
+            prosodic_style = model.predictor_encoder(gt.unsqueeze(1))
                 
             with torch.no_grad():
                 F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
@@ -381,13 +377,13 @@ def main(config_path):
                 N_real = log_norm(gt.unsqueeze(1)).squeeze(1)
                 
                 y_rec_gt = wav.unsqueeze(1)
-                y_rec_gt_pred = model.decoder(en, F0_real, N_real, s)
+                y_rec_gt_pred = model.decoder(en, F0_real, N_real, acoustic_style)
 
                 wav = y_rec_gt
 
-            F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
+            F0_fake, N_fake = model.predictor.F0Ntrain(p_en, prosodic_style)
 
-            y_rec = model.decoder(en, F0_fake, N_fake, s)
+            y_rec = model.decoder(en, F0_fake, N_fake, acoustic_style)
 
             loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
             loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
@@ -407,7 +403,7 @@ def main(config_path):
 
             loss_ce = 0
             loss_dur = 0
-            for _s2s_pred, _text_input, _text_length in zip(d, (d_gt), input_lengths):
+            for _s2s_pred, _text_input, _text_length in zip(d, (ground_truth_duration), input_lengths):
                 _s2s_pred = _s2s_pred[:_text_length, :]
                 _text_input = _text_input[:_text_length].long()
                 _s2s_trg = torch.zeros_like(_s2s_pred)
@@ -478,7 +474,7 @@ def main(config_path):
                                  waves, 
                                  mel_input_length,
                                  ref_texts, 
-                                 ref_lengths, use_ind, s_trg.detach(), ref if multispeaker else None)
+                                 ref_lengths, use_ind, s_trg.detach(), ref_style_encoded if multispeaker else None)
 
                 if slm_out is not None:
                     d_loss_slm, loss_gen_lm, y_pred = slm_out
@@ -577,10 +573,10 @@ def main(config_path):
                         s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
 
                         # encode
-                        t_en = model.text_encoder(texts, input_lengths, text_mask)
-                        asr = (t_en @ s2s_attn_mono)
+                        text_encoded = model.text_encoder(texts, input_lengths, text_mask)
+                        aligned_encoded_text = (text_encoded @ s2s_attn_mono)
 
-                        d_gt = s2s_attn_mono.sum(axis=-1).detach()
+                        ground_truth_duration = s2s_attn_mono.sum(axis=-1).detach()
 
                     ss = []
                     gs = []
@@ -615,7 +611,7 @@ def main(config_path):
                         mel_length = int(mel_input_length[bib].item() / 2)
 
                         random_start = np.random.randint(0, mel_length - mel_len)
-                        en.append(asr[bib, :, random_start:random_start+mel_len])
+                        en.append(aligned_encoded_text[bib, :, random_start:random_start+mel_len])
                         p_en.append(p[bib, :, random_start:random_start+mel_len])
 
                         gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
@@ -632,7 +628,7 @@ def main(config_path):
                     F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s)
 
                     loss_dur = 0
-                    for _s2s_pred, _text_input, _text_length in zip(d, (d_gt), input_lengths):
+                    for _s2s_pred, _text_input, _text_length in zip(d, (ground_truth_duration), input_lengths):
                         _s2s_pred = _s2s_pred[:_text_length, :]
                         _text_input = _text_input[:_text_length].long()
                         _s2s_trg = torch.zeros_like(_s2s_pred)
