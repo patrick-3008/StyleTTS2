@@ -7,8 +7,6 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torchaudio
-import librosa
 import click
 import shutil
 import warnings
@@ -214,11 +212,8 @@ def main(config_path):
     n_down = model.text_aligner.n_down
 
     best_loss = float('inf')  # best test loss
-    loss_train_record = list([])
-    loss_test_record = list([])
     iters = 0
     
-    criterion = nn.L1Loss() # F0 loss (regression)
     torch.cuda.empty_cache()
     
     stft_loss = MultiResolutionSTFTLoss().to(device)
@@ -226,8 +221,6 @@ def main(config_path):
     print('BERT', optimizer.optimizers['bert'])
     print('decoder', optimizer.optimizers['decoder'])
 
-    start_ds = False
-    
     running_std = []
     
     slmadv_params = Munch(config['slmadv_params'])
@@ -261,7 +254,6 @@ def main(config_path):
             texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
             with torch.no_grad():
                 mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
-                mel_mask = length_to_mask(mel_input_length).to(device)
                 text_mask = length_to_mask(input_lengths).to(texts.device)
 
                 # compute reference styles
@@ -271,7 +263,7 @@ def main(config_path):
                     ref = torch.cat([ref_ss, ref_sp], dim=1)
                 
             try:
-                ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
+                _, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
                 s2s_attn = s2s_attn.transpose(-1, -2)
                 s2s_attn = s2s_attn[..., 1:]
                 s2s_attn = s2s_attn.transpose(-1, -2)
@@ -340,7 +332,6 @@ def main(config_path):
                 loss_sty = 0
                 loss_diff = 0
 
-                
             s_loss = 0
             
 
@@ -569,7 +560,7 @@ def main(config_path):
 
         with torch.no_grad():
             iters_test = 0
-            for batch_idx, batch in enumerate(val_dataloader):
+            for _, batch in enumerate(val_dataloader):
                 optimizer.zero_grad()
 
                 try:
