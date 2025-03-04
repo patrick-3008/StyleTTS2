@@ -15,8 +15,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 from meldataset import build_dataloader
 
-from Utils.ASR.models import ASRCNN
-from Utils.JDC.model import JDCNet
 from Utils.PLBERT.util import load_plbert
 
 from models import *
@@ -67,7 +65,6 @@ def main(config_path):
     epochs = config.get('epochs', 200)
     save_freq = config.get('save_freq', 2)
     log_interval = config.get('log_interval', 10)
-    saving_epoch = config.get('save_freq', 2)
 
     data_params = config.get('data_params', None)
     sr = config['preprocess_params'].get('sr', 24000)
