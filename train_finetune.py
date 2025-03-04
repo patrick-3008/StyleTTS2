@@ -77,8 +77,8 @@ def main(config_path):
     max_len = config.get('max_len', 200)
     
     loss_params = Munch(config['loss_params'])
-    diff_epoch = loss_params.diff_epoch
-    joint_epoch = loss_params.joint_epoch
+    diffusion_training_epoch = loss_params.diffusion_training_epoch
+    joint_training_epoch = loss_params.joint_training_epoch
     
     optimizer_params = Munch(config['optimizer_params'])
     
@@ -144,8 +144,8 @@ def main(config_path):
                 ignore_modules=['bert', 'bert_encoder', 'predictor', 'predictor_encoder', 'msd', 'mpd', 'wd', 'diffusion']) # keep starting epoch for tensorboard log
 
             # these epochs should be counted from the start epoch
-            diff_epoch += start_epoch
-            joint_epoch += start_epoch
+            diffusion_training_epoch += start_epoch
+            joint_training_epoch += start_epoch
             epochs += start_epoch
             
             model.predictor_encoder = copy.deepcopy(model.style_encoder)
@@ -254,7 +254,7 @@ def main(config_path):
                 text_mask = length_to_mask(input_lengths).to(texts.device)
 
                 # compute reference styles
-                if multispeaker and epoch >= diff_epoch: 
+                if multispeaker and epoch >= diffusion_training_epoch: 
                     # TODO: it is starnge that we do batch computation for reference audio here while we don't do it for actual sample audio, given the avgpool layer in style encoders.
                     ref_acoustic_style_encoded = model.style_encoder(ref_mels.unsqueeze(1))
                     ref_prosodic_style_encoded = model.predictor_encoder(ref_mels.unsqueeze(1))
@@ -300,7 +300,7 @@ def main(config_path):
             d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
             
             # denoiser training
-            if epoch >= diff_epoch:
+            if epoch >= diffusion_training_epoch:
                 num_steps = np.random.randint(3, 5)
                 
                 if model_params.diffusion.dist.estimate_sigma_data:
@@ -453,11 +453,11 @@ def main(config_path):
             optimizer.step('text_encoder')
             optimizer.step('text_aligner')
             
-            if epoch >= diff_epoch:
+            if epoch >= diffusion_training_epoch:
                 optimizer.step('diffusion')
 
             d_loss_slm, loss_gen_lm = 0, 0
-            if epoch >= joint_epoch:
+            if epoch >= joint_training_epoch:
                 # randomly pick whether to use in-distribution text
                 if np.random.rand() < 0.5:
                     use_ind = True
