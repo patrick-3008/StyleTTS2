@@ -42,15 +42,6 @@ class MyDataParallel(torch.nn.DataParallel):
         except AttributeError:
             return getattr(self.module, name)
         
-import logging
-from logging import StreamHandler
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-handler = StreamHandler()
-handler.setLevel(logging.DEBUG)
-logger.addHandler(handler)
-
-
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -63,29 +54,18 @@ def main(config_path):
     # Initialize wandb
     wandb.init(project="style_tts2_finetune", config=config, dir=log_dir)
 
-    # write logs
-    file_handler = logging.FileHandler(os.path.join(log_dir, 'train.log'))
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
-    logger.addHandler(file_handler)
+    batch_size = config['batch_size']
 
-    
-    batch_size = config.get('batch_size', 10)
+    epochs = config['epochs']
+    save_freq = config['save_freq']
+    log_interval = config['log_interval']
 
-    epochs = config.get('epochs', 200)
-    save_freq = config.get('save_freq', 2)
-    log_interval = config.get('log_interval', 10)
-    saving_epoch = config.get('save_freq', 2)
-
-    data_params = config.get('data_params', None)
-    sr = config['preprocess_params'].get('sr', 24000)
+    data_params = config['data_params']
+    sr = config['preprocess_params']['sr']
     train_path = data_params['train_data']
     val_path = data_params['val_data']
-    root_path = data_params['root_path']
-    min_length = data_params['min_length']
-    OOD_data = data_params['OOD_data']
 
-    max_len = config.get('max_len', 200)
+    max_len = config['max_len']
     
     loss_params = Munch(config['loss_params'])
     diffusion_training_epoch = loss_params.diffusion_training_epoch
@@ -96,24 +76,8 @@ def main(config_path):
     train_list, val_list = get_data_path_list(train_path, val_path)
     device = accelerator.device
 
-    train_dataloader = build_dataloader(train_list,
-                                        root_path,
-                                        OOD_data=OOD_data,
-                                        min_length=min_length,
-                                        batch_size=batch_size,
-                                        num_workers=2,
-                                        dataset_config={},
-                                        device=device)
-
-    val_dataloader = build_dataloader(val_list,
-                                      root_path,
-                                      OOD_data=OOD_data,
-                                      min_length=min_length,
-                                      batch_size=batch_size,
-                                      validation=True,
-                                      num_workers=0,
-                                      device=device,
-                                      dataset_config={})
+    train_dataloader = build_dataloader(train_list, batch_size=batch_size, num_workers=2, device=device, **data_params)
+    val_dataloader = build_dataloader(val_list, batch_size=batch_size, validation=True, num_workers=0, device=device, **data_params)
     
     # load pretrained ASR model
     ASR_config = config.get('ASR_config', False)
@@ -671,10 +635,6 @@ def main(config_path):
                 except:
                     continue
 
-        print('Epochs:', epoch + 1)
-        logger.info('Validation loss: %.3f, Dur loss: %.3f, F0 loss: %.3f' % (loss_test / iters_test, loss_align / iters_test, loss_f / iters_test) + '\n\n\n')
-        print('\n\n\n')
-        
         # Log metrics to wandb instead of tensorboard
         wandb.log({
             'eval/mel_loss': loss_test / iters_test,

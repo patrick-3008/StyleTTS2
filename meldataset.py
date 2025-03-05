@@ -220,7 +220,7 @@ def build_dataloader(path_list,
                      num_workers=1,
                      device='cpu',
                      collate_config={},
-                     dataset_config={}):
+                     dataset_config={}, **kwargs):
     
     dataset = FilePathDataset(path_list, root_path, OOD_data=OOD_data, min_length=min_length, validation=validation, **dataset_config)
     collate_fn = Collater(**collate_config)
