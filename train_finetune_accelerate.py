@@ -137,6 +137,18 @@ def setup_optimizer(model, optimizer_params, epochs, train_dataloader):
             
     return optimizer
 
+def setup_losses_and_sampler(model, model_params, slmadv_params, sr, device, sampler):
+    """Set up loss functions and diffusion sampler."""
+    generator_loss = MyDataParallel(GeneratorLoss(model.mpd, model.msd).to(device))
+    discriminator_loss = MyDataParallel(DiscriminatorLoss(model.mpd, model.msd).to(device))
+    wavlm_loss = MyDataParallel(WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device))
+    stft_loss = MultiResolutionSTFTLoss().to(device)
+    
+   
+    slmadv = SLMAdversarialLoss(model, wavlm_loss, sampler, **slmadv_params)
+    
+    return generator_loss, discriminator_loss, wavlm_loss, stft_loss, slmadv, sampler
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -175,21 +187,18 @@ def main(config_path):
     multispeaker = model_params.multispeaker
     model = build_and_setup_model(model_params, text_aligner, pitch_extractor, plbert, device)
 
-    start_epoch = 0
-
-    gl = GeneratorLoss(model.mpd, model.msd).to(device)
-    dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
-    wl = WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device)
-
-    gl = MyDataParallel(gl)
-    dl = MyDataParallel(dl)
-    wl = MyDataParallel(wl)
-    
+    # Create sampler first so it can be used by SLMAdversarialLoss
     sampler = DiffusionSampler(
         model.diffusion.diffusion,
         sampler=ADPM2Sampler(),
         sigma_schedule=KarrasSchedule(sigma_min=0.0001, sigma_max=3.0, rho=9.0), # empirical parameters
         clamp=False
+    )
+ 
+    # Set up losses and sampler
+    slmadv_params = config['slmadv_params']
+    generator_loss, discriminator_loss, wavlm_loss, stft_loss, slmadv, sampler = setup_losses_and_sampler(
+        model, model_params, slmadv_params, sr, device, sampler
     )
     
     # Set up optimizer with appropriate learning rates
@@ -201,33 +210,20 @@ def main(config_path):
     best_loss = float('inf')  # best test loss
     iters = 0
     
-    torch.cuda.empty_cache()
-    
-    stft_loss = MultiResolutionSTFTLoss().to(device)
-    
     running_std = []
-    
-    slmadv_params = config['slmadv_params']
-    slmadv = SLMAdversarialLoss(model, wl, sampler, **slmadv_params)
-    
+   
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
+
+    torch.cuda.empty_cache()
 
     for epoch in range(start_epoch, epochs):
         running_loss = 0
 
         _ = [model[key].eval() for key in model]
+        _ = [model[key].train() for key in ['text_aligner', 'text_encoder', 'predictor', 'bert_encoder', 'bert', 'msd', 'mpd']]
         
-        model.text_aligner.train()
-        model.text_encoder.train()
-        
-        model.predictor.train()
-        model.bert_encoder.train()
-        model.bert.train()
-        model.msd.train()
-        model.mpd.train()
-
         for i, batch in enumerate(train_dataloader):
             waves = batch[0]
             batch = [b.to(device) for b in batch[1:]]
@@ -378,7 +374,7 @@ def main(config_path):
             loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
 
             optimizer.zero_grad()
-            d_loss = dl(wav.detach(), y_rec.detach()).mean()
+            d_loss = discriminator_loss(wav.detach(), y_rec.detach()).mean()
             accelerator.backward(d_loss)
             optimizer.step('msd')
             optimizer.step('mpd')
@@ -387,8 +383,8 @@ def main(config_path):
             optimizer.zero_grad()
 
             loss_mel = stft_loss(y_rec, wav)
-            loss_gen_all = gl(wav, y_rec).mean()
-            loss_lm = wl(wav.detach().squeeze(tuple(range(1, len(wav.shape)))), y_rec.squeeze(tuple(range(1, len(y_rec.shape))))).mean()
+            loss_gen_all = generator_loss(wav, y_rec).mean()
+            loss_lm = wavlm_loss(wav.detach().squeeze(tuple(range(1, len(wav.shape)))), y_rec.squeeze(tuple(range(1, len(y_rec.shape))))).mean()
 
             loss_ce = 0
             loss_dur = 0
