@@ -5,13 +5,12 @@ import time
 from munch import Munch
 import numpy as np
 import torch
-from torch import nn
 import torch.nn.functional as F
 import click
 import shutil
 import warnings
 warnings.simplefilter('ignore')
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 from meldataset import build_dataloader
 
@@ -55,7 +54,9 @@ def main(config_path):
     log_dir = config['log_dir']
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
-    writer = SummaryWriter(log_dir + "/tensorboard")
+    
+    # Initialize wandb
+    wandb.init(project="style_tts2_finetune", config=config, dir=log_dir)
 
     # write logs
     file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
@@ -535,25 +536,23 @@ def main(config_path):
             iters = iters + 1
             
             if (i+1)%log_interval == 0:
-                logger.info ('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f, SLoss: %.5f, S2S Loss: %.5f, Mono Loss: %.5f'
-                    %(epoch+1, epochs, i+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_ce, loss_norm_rec, loss_F0_rec, loss_lm, loss_gen_all, loss_sty, loss_diff, d_loss_slm, loss_gen_lm, s_loss, loss_s2s, loss_mono))
-                
-                writer.add_scalar('train/mel_loss', running_loss / log_interval, iters)
-                writer.add_scalar('train/gen_loss', loss_gen_all, iters)
-                writer.add_scalar('train/d_loss', d_loss, iters)
-                writer.add_scalar('train/ce_loss', loss_ce, iters)
-                writer.add_scalar('train/dur_loss', loss_dur, iters)
-                writer.add_scalar('train/slm_loss', loss_lm, iters)
-                writer.add_scalar('train/norm_loss', loss_norm_rec, iters)
-                writer.add_scalar('train/F0_loss', loss_F0_rec, iters)
-                writer.add_scalar('train/sty_loss', loss_sty, iters)
-                writer.add_scalar('train/diff_loss', loss_diff, iters)
-                writer.add_scalar('train/d_loss_slm', d_loss_slm, iters)
-                writer.add_scalar('train/gen_loss_slm', loss_gen_lm, iters)
+                # Log metrics to wandb
+                wandb.log({
+                    'train/mel_loss': running_loss / log_interval,
+                    'train/gen_loss': loss_gen_all,
+                    'train/d_loss': d_loss,
+                    'train/ce_loss': loss_ce,
+                    'train/dur_loss': loss_dur,
+                    'train/slm_loss': loss_lm,
+                    'train/norm_loss': loss_norm_rec,
+                    'train/F0_loss': loss_F0_rec,
+                    'train/sty_loss': loss_sty,
+                    'train/diff_loss': loss_diff,
+                    'train/d_loss_slm': d_loss_slm,
+                    'train/gen_loss_slm': loss_gen_lm,
+                })
                 
                 running_loss = 0
-                
-                print('Time elasped:', time.time()-start_time)
             
         loss_test = 0
         loss_align = 0
@@ -670,10 +669,13 @@ def main(config_path):
         print('Epochs:', epoch + 1)
         logger.info('Validation loss: %.3f, Dur loss: %.3f, F0 loss: %.3f' % (loss_test / iters_test, loss_align / iters_test, loss_f / iters_test) + '\n\n\n')
         print('\n\n\n')
-        writer.add_scalar('eval/mel_loss', loss_test / iters_test, epoch + 1)
-        writer.add_scalar('eval/dur_loss', loss_test / iters_test, epoch + 1)
-        writer.add_scalar('eval/F0_loss', loss_f / iters_test, epoch + 1)
         
+        # Log metrics to wandb instead of tensorboard
+        wandb.log({
+            'eval/mel_loss': loss_test / iters_test,
+            'eval/dur_loss': loss_align / iters_test,
+            'eval/F0_loss': loss_f / iters_test
+        }, step=epoch + 1)
         
         if (epoch + 1) % save_freq == 0 :
             if (loss_test / iters_test) < best_loss:
