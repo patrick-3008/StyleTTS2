@@ -42,43 +42,19 @@ class MyDataParallel(torch.nn.DataParallel):
         except AttributeError:
             return getattr(self.module, name)
         
-@click.command()
-@click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
-def main(config_path):
+def setup_logging(config_path, log_dir):
+    """Set up logging directory and copy config file."""
+
     config = yaml.safe_load(open(config_path))
-    
-    log_dir = config['log_dir']
-    if not os.path.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, os.path.join(log_dir, os.path.basename(config_path)))
     
     # Initialize wandb
     wandb.init(project="style_tts2_finetune", config=config, dir=log_dir)
 
-    batch_size = config['batch_size']
-
-    epochs = config['epochs']
-    save_freq = config['save_freq']
-    log_interval = config['log_interval']
-
-    data_params = config['data_params']
-    sr = config['preprocess_params']['sr']
-    train_path = data_params['train_data']
-    val_path = data_params['val_data']
-
-    max_len = config['max_len']
-    
-    loss_params = Munch(config['loss_params'])
-    diffusion_training_epoch = loss_params.diffusion_training_epoch
-    joint_training_epoch = loss_params.joint_training_epoch
-    
-    optimizer_params = Munch(config['optimizer_params'])
-    
-    train_list, val_list = get_data_path_list(train_path, val_path)
-    device = accelerator.device
-
-    train_dataloader = build_dataloader(train_list, batch_size=batch_size, num_workers=2, device=device, **data_params)
-    val_dataloader = build_dataloader(val_list, batch_size=batch_size, validation=True, num_workers=0, device=device, **data_params)
-    
+def load_models(config, device):
+    """Load pretrained models (ASR, F0, PLBERT)."""
     # load pretrained ASR model
     ASR_config = config.get('ASR_config', False)
     ASR_path = config.get('ASR_path', False)
@@ -92,17 +68,83 @@ def main(config_path):
     BERT_path = config.get('PLBERT_dir', False)
     plbert = load_plbert(BERT_path)
     
-    # build model
-    model_params = recursive_munch(config['model_params'])
-    multispeaker = model_params.multispeaker
+    return text_aligner, pitch_extractor, plbert
+
+def build_and_setup_model(model_params, text_aligner, pitch_extractor, plbert, device):
+    """Build model and move to device."""
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
     _ = [model[key].to(device) for key in model]
     
-    # DP
+    # Apply DataParallel to appropriate model components
     for key in model:
         if key != "mpd" and key != "msd" and key != "wd":
             model[key] = MyDataParallel(model[key])
-            
+    
+    return model
+
+def setup_dataloaders(data_params, batch_size, device):
+    """Set up training and validation dataloaders."""
+    train_path = data_params['train_data']
+    val_path = data_params['val_data']
+    
+    train_list, val_list = get_data_path_list(train_path, val_path)
+    
+    train_dataloader = build_dataloader(
+        train_list, 
+        batch_size=batch_size, 
+        num_workers=2, 
+        device=device, 
+        **data_params
+    )
+    
+    val_dataloader = build_dataloader(
+        val_list, 
+        batch_size=batch_size, 
+        validation=True, 
+        num_workers=0, 
+        device=device, 
+        **data_params
+    )
+    
+    return train_dataloader, val_dataloader
+
+@click.command()
+@click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
+def main(config_path):
+    config = yaml.safe_load(open(config_path))
+    
+    # Extract configuration parameters
+    log_dir = config['log_dir']
+    batch_size = config['batch_size']
+    epochs = config['epochs']
+    save_freq = config['save_freq']
+    log_interval = config['log_interval']
+    data_params = config['data_params']
+    sr = config['preprocess_params']['sr']
+    max_len = config['max_len']
+    
+    loss_params = Munch(config['loss_params'])
+    diffusion_training_epoch = loss_params.diffusion_training_epoch
+    joint_training_epoch = loss_params.joint_training_epoch
+    
+    optimizer_params = Munch(config['optimizer_params'])
+    
+    # Set up logging
+    setup_logging(config_path, log_dir)
+    
+    # Get device from accelerator
+    device = accelerator.device
+    
+    # Set up dataloaders
+    train_dataloader, val_dataloader = setup_dataloaders(data_params, batch_size, device)
+    
+    # Load pretrained models
+    text_aligner, pitch_extractor, plbert = load_models(config, device)
+    
+    # Build and setup model
+    model_params = recursive_munch(config['model_params'])
+    multispeaker = model_params.multispeaker
+    model = build_and_setup_model(model_params, text_aligner, pitch_extractor, plbert, device)
     start_epoch = 0
     iters = 0
 
