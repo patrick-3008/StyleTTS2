@@ -191,6 +191,65 @@ def process_attention_matrix(s2s_attn):
     
     return s2s_attn
 
+def train_diffusion(model, model_params, sampler, s_trg, bert_dur, ref_mels=None, device=None):
+    """
+    Train the diffusion model component.
+    
+    Args:
+        model: The model containing the diffusion component
+        model_params: Model parameters
+        sampler: The diffusion sampler
+        s_trg: Target style vector
+        bert_dur: BERT duration embeddings
+        ref_mels: Reference mel spectrograms (for multispeaker training)
+        device: The device to run on
+        
+    Returns:
+        tuple: (loss_diff, loss_sty, sigma_data) - diffusion loss, style loss, and sigma data if estimated
+    """
+    num_steps = np.random.randint(3, 5)
+    sigma_data = None
+    
+    if model_params.diffusion.dist.estimate_sigma_data:
+        sigma_data = s_trg.std(axis=-1).mean().item()  # batch-wise std estimation
+        model.diffusion.module.diffusion.sigma_data = sigma_data
+    
+    multispeaker = model_params.multispeaker
+    if multispeaker:
+        reference_styles = compute_reference_styles(model, ref_mels)
+        
+        s_preds = sampler(
+            noise=torch.randn_like(s_trg).unsqueeze(1).to(device),
+            embedding=bert_dur,
+            embedding_scale=1,
+            features=reference_styles,  # reference from the same speaker as the embedding
+            embedding_mask_proba=0.1,
+            num_steps=num_steps
+        ).squeeze(1)
+        
+        loss_diff = model.diffusion(
+            s_trg.unsqueeze(1), 
+            embedding=bert_dur, 
+            features=reference_styles
+        ).mean()  # EDM loss
+    else:
+        s_preds = sampler(
+            noise=torch.randn_like(s_trg).unsqueeze(1).to(device),
+            embedding=bert_dur,
+            embedding_scale=1,
+            embedding_mask_proba=0.1,
+            num_steps=num_steps
+        ).squeeze(1)
+        
+        loss_diff = model.diffusion.module.diffusion(
+            s_trg.unsqueeze(1), 
+            embedding=bert_dur
+        ).mean()  # EDM loss
+    
+    loss_sty = F.l1_loss(s_preds, s_trg.detach())  # style reconstruction loss
+    
+    return loss_diff, loss_sty, sigma_data
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -311,31 +370,18 @@ def main(config_path):
             
             # denoiser training
             if epoch >= diffusion_training_epoch:
-                num_steps = np.random.randint(3, 5)
+                loss_diff, loss_sty, sigma_data = train_diffusion(
+                    model, 
+                    model_params, 
+                    sampler, 
+                    s_trg, 
+                    bert_dur, 
+                    ref_mels if multispeaker else None,
+                    device
+                )
                 
-                if model_params.diffusion.dist.estimate_sigma_data:
-                    model.diffusion.module.diffusion.sigma_data = s_trg.std(axis=-1).mean().item() # batch-wise std estimation
-                    running_std.append(model.diffusion.module.diffusion.sigma_data)
-                    
-                if multispeaker:
-                    reference_styles = compute_reference_styles(model, ref_mels)
-
-                    s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
-                        embedding=bert_dur,
-                        embedding_scale=1,
-                        features=reference_styles, # reference from the same speaker as the embedding
-                        embedding_mask_proba=0.1,
-                        num_steps=num_steps).squeeze(1)
-                    loss_diff = model.diffusion(s_trg.unsqueeze(1), embedding=bert_dur, features=reference_styles).mean() # EDM loss
-                    loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
-                else:
-                    s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
-                          embedding=bert_dur,
-                          embedding_scale=1,
-                             embedding_mask_proba=0.1,
-                             num_steps=num_steps).squeeze(1)                    
-                    loss_diff = model.diffusion.module.diffusion(s_trg.unsqueeze(1), embedding=bert_dur).mean() # EDM loss
-                    loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
+                if sigma_data is not None:
+                    running_std.append(sigma_data)
             else:
                 loss_sty = 0
                 loss_diff = 0
