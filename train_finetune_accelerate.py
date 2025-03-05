@@ -250,6 +250,39 @@ def train_diffusion(model, model_params, sampler, s_trg, bert_dur, ref_mels=None
     
     return loss_diff, loss_sty, sigma_data
 
+def align_text_to_speech(model, texts, input_lengths, mel_input_length, s2s_attn, text_mask, n_down):
+    """
+    Aligns encoded text to speech using attention matrices and computes durations.
+    
+    Args:
+        model: The model containing text_encoder
+        texts: Input text tokens
+        input_lengths: Lengths of input texts
+        mel_input_length: Lengths of mel spectrograms
+        s2s_attn: Speech-to-text attention matrix
+        text_mask: Mask for text inputs
+        n_down: Downsampling factor
+        
+    Returns:
+        tuple: (aligned_text_features, monotonic_attention, duration_gt) - 
+               aligned text features, monotonic attention matrix, and ground truth durations
+    """
+    mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
+    monotonic_attention = maximum_path(s2s_attn, mask_ST)
+
+    # encode text
+    encoded_text = model.text_encoder(texts, input_lengths, text_mask)
+    
+    # 50% chance of using monotonic version of attention
+    if bool(random.getrandbits(1)):
+        aligned_text_features = (encoded_text @ s2s_attn)
+    else:
+        aligned_text_features = (encoded_text @ monotonic_attention)
+
+    duration_gt = monotonic_attention.sum(axis=-1).detach()
+    
+    return aligned_text_features, monotonic_attention, duration_gt
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -334,19 +367,7 @@ def main(config_path):
             except:
                 continue
 
-            mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
-            s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
-
-            # encode
-            t_en = model.text_encoder(texts, input_lengths, text_mask)
-            
-            # 50% of chance of using monotonic version
-            if bool(random.getrandbits(1)):
-                asr = (t_en @ s2s_attn)
-            else:
-                asr = (t_en @ s2s_attn_mono)
-
-            d_gt = s2s_attn_mono.sum(axis=-1).detach()
+            aligned_text, s2s_attn_mono, d_gt = align_text_to_speech(model, texts, input_lengths, mel_input_length, s2s_attn, text_mask, n_down)
 
             # compute the style of the entire utterance
             # this operation cannot be done in batch because of the avgpool layer (may need to work on masked avgpool)
@@ -401,7 +422,7 @@ def main(config_path):
                 mel_length = int(mel_input_length[bib].item() / 2)
 
                 random_start = np.random.randint(0, mel_length - mel_len)
-                en.append(asr[bib, :, random_start:random_start+mel_len])
+                en.append(aligned_text[bib, :, random_start:random_start+mel_len])
                 p_en.append(p[bib, :, random_start:random_start+mel_len])
                 gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
                 
@@ -527,7 +548,7 @@ def main(config_path):
                                  waves, 
                                  mel_input_length,
                                  ref_texts, 
-                                 ref_lengths, use_ind, s_trg.detach(), reference_styles if multispeaker else None)
+                                 ref_lengths, use_ind, s_trg.detach(), compute_reference_styles(model, ref_mels) if multispeaker else None)
 
                 if slm_out is not None:
                     d_loss_slm, loss_gen_lm, y_pred = slm_out
@@ -617,14 +638,7 @@ def main(config_path):
                     _, _, s2s_attn = model.text_aligner(mels, mel_mask, texts)
                     s2s_attn = process_attention_matrix(s2s_attn)
 
-                    mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
-                    s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
-
-                    # encode
-                    t_en = model.text_encoder(texts, input_lengths, text_mask)
-                    asr = (t_en @ s2s_attn_mono)
-
-                    d_gt = s2s_attn_mono.sum(axis=-1).detach()
+                    aligned_text, s2s_attn_mono, d_gt = align_text_to_speech(model, texts, input_lengths, mel_input_length, s2s_attn, text_mask, n_down)
 
                     ss = []
                     gs = []
@@ -644,10 +658,7 @@ def main(config_path):
 
                     bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
                     d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
-                    d, p = model.predictor(d_en, s, 
-                                                        input_lengths, 
-                                                        s2s_attn_mono, 
-                                                        text_mask)
+                    d, p = model.predictor(d_en, s, input_lengths, s2s_attn_mono, text_mask)
                     # get clips
                     mel_len = int(mel_input_length.min().item() / 2 - 1)
                     en = []
@@ -660,7 +671,7 @@ def main(config_path):
                         mel_length = int(mel_input_length[bib].item() / 2)
 
                         random_start = np.random.randint(0, mel_length - mel_len)
-                        en.append(asr[bib, :, random_start:random_start+mel_len])
+                        en.append(aligned_text[bib, :, random_start:random_start+mel_len])
                         p_en.append(p[bib, :, random_start:random_start+mel_len])
 
                         gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
