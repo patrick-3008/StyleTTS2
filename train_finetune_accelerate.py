@@ -53,20 +53,16 @@ def setup_logging(config_path, log_dir):
     # Initialize wandb
     wandb.init(project="style_tts2_finetune", config=config, dir=log_dir)
 
-def load_models(config, device):
+def load_pretrained_models(config, device):
     """Load pretrained models (ASR, F0, PLBERT)."""
     # load pretrained ASR model
-    ASR_config = config.get('ASR_config', False)
-    ASR_path = config.get('ASR_path', False)
-    text_aligner = load_ASR_models(ASR_path, ASR_config)
+    text_aligner = load_ASR_models(config['ASR_path'], config['ASR_config'])
     
     # load pretrained F0 model
-    F0_path = config.get('F0_path', False)
-    pitch_extractor = load_F0_models(F0_path)
+    pitch_extractor = load_F0_models(config['F0_path'])
     
     # load PL-BERT model
-    BERT_path = config.get('PLBERT_dir', False)
-    plbert = load_plbert(BERT_path)
+    plbert = load_plbert(config['PLBERT_dir'])
     
     return text_aligner, pitch_extractor, plbert
 
@@ -76,10 +72,7 @@ def build_and_setup_model(model_params, text_aligner, pitch_extractor, plbert, d
     _ = [model[key].to(device) for key in model]
     
     # Apply DataParallel to appropriate model components
-    for key in model:
-        if key != "mpd" and key != "msd" and key != "wd":
-            model[key] = MyDataParallel(model[key])
-    
+    model = Munch({key: MyDataParallel(model[key]) if key not in ["mpd", "msd", "wd"] else model[key] for key in model})
     return model
 
 def setup_dataloaders(data_params, batch_size, device):
@@ -107,6 +100,42 @@ def setup_dataloaders(data_params, batch_size, device):
     )
     
     return train_dataloader, val_dataloader
+
+def setup_optimizer(model, optimizer_params, epochs, train_dataloader):
+    """Set up and configure the optimizer with appropriate learning rates."""
+    scheduler_params = {
+        "max_lr": optimizer_params.lr,
+        "pct_start": float(0),
+        "epochs": epochs,
+        "steps_per_epoch": len(train_dataloader),
+    }
+
+    scheduler_params_dict = {key: scheduler_params.copy() for key in model}
+    scheduler_params_dict['bert']['max_lr'] = optimizer_params.bert_lr * 2
+    scheduler_params_dict['decoder']['max_lr'] = optimizer_params.ft_lr * 2
+    scheduler_params_dict['style_encoder']['max_lr'] = optimizer_params.ft_lr * 2
+    
+    optimizer = build_optimizer({key: model[key].parameters() for key in model},
+                               scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr)
+    
+    # adjust BERT learning rate
+    for g in optimizer.optimizers['bert'].param_groups:
+        g['betas'] = (0.9, 0.99)
+        g['lr'] = optimizer_params.bert_lr
+        g['initial_lr'] = optimizer_params.bert_lr
+        g['min_lr'] = 0
+        g['weight_decay'] = 0.01
+        
+    # adjust acoustic module learning rate
+    for module in ["decoder", "style_encoder"]:
+        for g in optimizer.optimizers[module].param_groups:
+            g['betas'] = (0.0, 0.99)
+            g['lr'] = optimizer_params.ft_lr
+            g['initial_lr'] = optimizer_params.ft_lr
+            g['min_lr'] = 0
+            g['weight_decay'] = 1e-4
+            
+    return optimizer
 
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
@@ -139,42 +168,18 @@ def main(config_path):
     train_dataloader, val_dataloader = setup_dataloaders(data_params, batch_size, device)
     
     # Load pretrained models
-    text_aligner, pitch_extractor, plbert = load_models(config, device)
+    text_aligner, pitch_extractor, plbert = load_pretrained_models(config, device)
     
     # Build and setup model
     model_params = recursive_munch(config['model_params'])
     multispeaker = model_params.multispeaker
     model = build_and_setup_model(model_params, text_aligner, pitch_extractor, plbert, device)
+
     start_epoch = 0
-    iters = 0
-
-    load_pretrained = config.get('pretrained_model', '') != '' and config.get('second_stage_load_pretrained', False)
-    
-    if not load_pretrained:
-        if config.get('first_stage_path', '') != '':
-            first_stage_path = os.path.join(log_dir, config.get('first_stage_path', 'first_stage.pth'))
-            print('Loading the first stage model at %s ...' % first_stage_path)
-            model, _, start_epoch, iters = load_checkpoint(model, 
-                None, 
-                first_stage_path,
-                load_only_params=True,
-                ignore_modules=['bert', 'bert_encoder', 'predictor', 'predictor_encoder', 'msd', 'mpd', 'wd', 'diffusion']) # keep starting epoch for tensorboard log
-
-            # these epochs should be counted from the start epoch
-            diffusion_training_epoch += start_epoch
-            joint_training_epoch += start_epoch
-            epochs += start_epoch
-            
-            model.predictor_encoder = copy.deepcopy(model.style_encoder)
-        else:
-            raise ValueError('You need to specify the path to the first stage model.') 
 
     gl = GeneratorLoss(model.mpd, model.msd).to(device)
     dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
-    wl = WavLMLoss(model_params.slm.model, 
-                   model.wd, 
-                   sr, 
-                   model_params.slm.sr).to(device)
+    wl = WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device)
 
     gl = MyDataParallel(gl)
     dl = MyDataParallel(dl)
@@ -187,41 +192,9 @@ def main(config_path):
         clamp=False
     )
     
-    scheduler_params = {
-        "max_lr": optimizer_params.lr,
-        "pct_start": float(0),
-        "epochs": epochs,
-        "steps_per_epoch": len(train_dataloader),
-    }
-    scheduler_params_dict= {key: scheduler_params.copy() for key in model}
-    scheduler_params_dict['bert']['max_lr'] = optimizer_params.bert_lr * 2
-    scheduler_params_dict['decoder']['max_lr'] = optimizer_params.ft_lr * 2
-    scheduler_params_dict['style_encoder']['max_lr'] = optimizer_params.ft_lr * 2
-    
-    optimizer = build_optimizer({key: model[key].parameters() for key in model},
-                                          scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr)
-    
-    # adjust BERT learning rate
-    for g in optimizer.optimizers['bert'].param_groups:
-        g['betas'] = (0.9, 0.99)
-        g['lr'] = optimizer_params.bert_lr
-        g['initial_lr'] = optimizer_params.bert_lr
-        g['min_lr'] = 0
-        g['weight_decay'] = 0.01
-        
-    # adjust acoustic module learning rate
-    for module in ["decoder", "style_encoder"]:
-        for g in optimizer.optimizers[module].param_groups:
-            g['betas'] = (0.0, 0.99)
-            g['lr'] = optimizer_params.ft_lr
-            g['initial_lr'] = optimizer_params.ft_lr
-            g['min_lr'] = 0
-            g['weight_decay'] = 1e-4
-        
-    # load models if there is a model
-    if load_pretrained:
-        model, optimizer, start_epoch, iters = load_checkpoint(model,  optimizer, config['pretrained_model'],
-                                    load_only_params=config.get('load_only_params', True))
+    # Set up optimizer with appropriate learning rates
+    optimizer = setup_optimizer(model, optimizer_params, epochs, train_dataloader)
+    model, optimizer, start_epoch, _ = load_checkpoint(model, optimizer, config['pretrained_model'], load_only_params=config['load_only_params'])
 
     n_down = model.text_aligner.n_down
 
@@ -234,14 +207,8 @@ def main(config_path):
     
     running_std = []
     
-    slmadv_params = Munch(config['slmadv_params'])
-    slmadv = SLMAdversarialLoss(model, wl, sampler, 
-                                slmadv_params.min_len, 
-                                slmadv_params.max_len,
-                                batch_percentage=slmadv_params.batch_percentage,
-                                skip_update=slmadv_params.iter, 
-                                sig=slmadv_params.sig
-                               )
+    slmadv_params = config['slmadv_params']
+    slmadv = SLMAdversarialLoss(model, wl, sampler, **slmadv_params)
     
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
@@ -249,7 +216,6 @@ def main(config_path):
 
     for epoch in range(start_epoch, epochs):
         running_loss = 0
-        start_time = time.time()
 
         _ = [model[key].eval() for key in model]
         
@@ -268,7 +234,6 @@ def main(config_path):
             texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
             with torch.no_grad():
                 mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
-                mel_mask = length_to_mask(mel_input_length).to(device)
                 text_mask = length_to_mask(input_lengths).to(texts.device)
 
                 # compute reference styles
@@ -515,7 +480,7 @@ def main(config_path):
                         total_norm[key] = total_norm[key] ** 0.5
 
                     # gradient scaling
-                    if total_norm['predictor'] > slmadv_params.thresh:
+                    if total_norm['predictor'] > slmadv_params['thresh']:
                         for key in model.keys():
                             for p in model[key].parameters():
                                 if p.grad is not None:
@@ -523,15 +488,15 @@ def main(config_path):
 
                     for p in model.predictor.duration_proj.parameters():
                         if p.grad is not None:
-                            p.grad *= slmadv_params.scale
+                            p.grad *= slmadv_params['scale']
 
                     for p in model.predictor.lstm.parameters():
                         if p.grad is not None:
-                            p.grad *= slmadv_params.scale
+                            p.grad *= slmadv_params['scale']
 
                     for p in model.diffusion.parameters():
                         if p.grad is not None:
-                            p.grad *= slmadv_params.scale
+                            p.grad *= slmadv_params['scale']
                     
                     optimizer.step('bert_encoder')
                     optimizer.step('bert')
