@@ -86,8 +86,8 @@ def main(config_path):
     max_len = config.get('max_len', 200)
     
     loss_params = Munch(config['loss_params'])
-    diff_epoch = loss_params.diff_epoch
-    joint_epoch = loss_params.joint_epoch
+    diffusion_training_epoch = loss_params.diffusion_training_epoch
+    joint_training_epoch = loss_params.joint_training_epoch
     
     optimizer_params = Munch(config['optimizer_params'])
     
@@ -153,8 +153,8 @@ def main(config_path):
                 ignore_modules=['bert', 'bert_encoder', 'predictor', 'predictor_encoder', 'msd', 'mpd', 'wd', 'diffusion']) # keep starting epoch for tensorboard log
 
             # these epochs should be counted from the start epoch
-            diff_epoch += start_epoch
-            joint_epoch += start_epoch
+            diffusion_training_epoch += start_epoch
+            joint_training_epoch += start_epoch
             epochs += start_epoch
             
             model.predictor_encoder = copy.deepcopy(model.style_encoder)
@@ -214,7 +214,7 @@ def main(config_path):
     if load_pretrained:
         model, optimizer, start_epoch, iters = load_checkpoint(model,  optimizer, config['pretrained_model'],
                                     load_only_params=config.get('load_only_params', True))
-        
+
     n_down = model.text_aligner.n_down
 
     best_loss = float('inf')  # best test loss
@@ -242,7 +242,7 @@ def main(config_path):
                                 skip_update=slmadv_params.iter, 
                                 sig=slmadv_params.sig
                                )
-
+    
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
@@ -272,7 +272,7 @@ def main(config_path):
                 text_mask = length_to_mask(input_lengths).to(texts.device)
 
                 # compute reference styles
-                if multispeaker and epoch >= diff_epoch:
+                if multispeaker and epoch >= diffusion_training_epoch:
                     ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
                     ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
                     ref = torch.cat([ref_ss, ref_sp], dim=1)
@@ -311,15 +311,16 @@ def main(config_path):
                 s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
                 gs.append(s)
 
-            s_dur = torch.stack(ss).squeeze()  # global prosodic styles
-            gs = torch.stack(gs).squeeze() # global acoustic styles
+            # Fix: Use squeeze(1) instead of squeeze() to avoid removing batch dimension
+            s_dur = torch.stack(ss); s_dur = s_dur.squeeze(tuple(range(1, len(s_dur.shape))))  # global prosodic styles
+            gs = torch.stack(gs); gs = gs.squeeze(tuple(range(1, len(gs.shape)))) # global acoustic styles
             s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
 
             bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
             d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
             
             # denoiser training
-            if epoch >= diff_epoch:
+            if epoch >= diffusion_training_epoch:
                 num_steps = np.random.randint(3, 5)
                 
                 if model_params.diffusion.dist.estimate_sigma_data:
@@ -422,7 +423,7 @@ def main(config_path):
 
             loss_mel = stft_loss(y_rec, wav)
             loss_gen_all = gl(wav, y_rec).mean()
-            loss_lm = wl(wav.detach().squeeze(), y_rec.squeeze()).mean()
+            loss_lm = wl(wav.detach().squeeze(tuple(range(1, len(wav.shape)))), y_rec.squeeze(tuple(range(1, len(y_rec.shape))))).mean()
 
             loss_ce = 0
             loss_dur = 0
@@ -462,9 +463,6 @@ def main(config_path):
             
             running_loss += loss_mel.item()
             accelerator.backward(g_loss)
-            if torch.isnan(g_loss):
-                from IPython.core.debugger import set_trace
-                set_trace()
 
             optimizer.step('bert_encoder')
             optimizer.step('bert')
@@ -476,11 +474,11 @@ def main(config_path):
             optimizer.step('text_encoder')
             optimizer.step('text_aligner')
             
-            if epoch >= diff_epoch:
+            if epoch >= diffusion_training_epoch:
                 optimizer.step('diffusion')
 
             d_loss_slm, loss_gen_lm = 0, 0
-            if epoch >= joint_epoch:
+            if epoch >= joint_training_epoch:
                 # randomly pick whether to use in-distribution text
                 if np.random.rand() < 0.5:
                     use_ind = True
@@ -612,8 +610,9 @@ def main(config_path):
                         s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
                         gs.append(s)
 
-                    s = torch.stack(ss).squeeze()
-                    gs = torch.stack(gs).squeeze()
+                    # Fix: Use squeeze(1) instead of squeeze() to avoid removing batch dimension
+                    s = torch.stack(ss); s = s.squeeze(tuple(range(1, len(s.shape))))
+                    gs = torch.stack(gs); gs = gs.squeeze(tuple(range(1, len(gs.shape))))
                     s_trg = torch.cat([s, gs], dim=-1).detach()
 
                     bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
