@@ -149,6 +149,48 @@ def setup_losses_and_sampler(model, model_params, slmadv_params, sr, device, sam
     
     return generator_loss, discriminator_loss, wavlm_loss, stft_loss, slmadv, sampler
 
+def compute_reference_styles(model, ref_mels):
+    """Compute reference styles for multispeaker training with no gradient tracking."""
+    with torch.no_grad():
+        ref_acoustic_style = model.style_encoder(ref_mels.unsqueeze(1))
+        ref_prosodic_style = model.predictor_encoder(ref_mels.unsqueeze(1))
+        return torch.cat([ref_acoustic_style, ref_prosodic_style], dim=1)
+
+def create_masks(mel_input_length, input_lengths, n_down, device):
+    """Create masks for text and mel inputs based on their lengths."""
+    with torch.no_grad():
+        mel_mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
+        text_mask = length_to_mask(input_lengths).to(device)
+    return mel_mask, text_mask
+
+def process_attention_matrix(s2s_attn):
+    """
+    Process the attention matrix from the text aligner.
+    
+    This function:
+    1. Transposes the attention matrix to swap the last two dimensions
+    2. Removes the first frame/token (likely a start token or padding)
+    3. Transposes back to the original dimension order
+    
+    Args:
+        s2s_attn: The speech-to-text attention matrix from the text aligner
+        
+    Returns:
+        Processed attention matrix with the first token removed
+    """
+    # Swap the last two dimensions (batch_size, heads, text_len, mel_len) -> (batch_size, heads, mel_len, text_len)
+    s2s_attn = s2s_attn.transpose(-1, -2)
+    
+    # Remove the first token/frame (likely a start token or padding)
+    # This slices out everything except the first element in the last dimension
+    s2s_attn = s2s_attn[..., 1:]
+    
+    # Transpose back to original dimension order
+    # (batch_size, heads, mel_len, text_len) -> (batch_size, heads, text_len, mel_len)
+    s2s_attn = s2s_attn.transpose(-1, -2)
+    
+    return s2s_attn
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -207,10 +249,7 @@ def main(config_path):
 
     n_down = model.text_aligner.n_down
 
-    best_loss = float('inf')  # best test loss
-    iters = 0
-    
-    running_std = []
+    best_loss = float('inf'); iters = 0; running_std = []
    
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
@@ -225,24 +264,14 @@ def main(config_path):
         _ = [model[key].train() for key in ['text_aligner', 'text_encoder', 'predictor', 'bert_encoder', 'bert', 'msd', 'mpd']]
         
         for i, batch in enumerate(train_dataloader):
-            waves = batch[0]
-            batch = [b.to(device) for b in batch[1:]]
-            texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
-            with torch.no_grad():
-                mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
-                text_mask = length_to_mask(input_lengths).to(texts.device)
+            _ = [b.to(device) for i, b in enumerate(batch) if i > 0]
+            waves, texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
 
-                # compute reference styles
-                if multispeaker and epoch >= diffusion_training_epoch:
-                    ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
-                    ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
-                    ref = torch.cat([ref_ss, ref_sp], dim=1)
-                
+            mel_mask, text_mask = create_masks(mel_input_length, input_lengths, n_down, device)
+
             try:
-                _, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
-                s2s_attn = s2s_attn.transpose(-1, -2)
-                s2s_attn = s2s_attn[..., 1:]
-                s2s_attn = s2s_attn.transpose(-1, -2)
+                _, s2s_pred, s2s_attn = model.text_aligner(mels, mel_mask, texts)
+                s2s_attn = process_attention_matrix(s2s_attn)
             except:
                 continue
 
@@ -289,13 +318,15 @@ def main(config_path):
                     running_std.append(model.diffusion.module.diffusion.sigma_data)
                     
                 if multispeaker:
+                    reference_styles = compute_reference_styles(model, ref_mels)
+
                     s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
-                          embedding=bert_dur,
-                          embedding_scale=1,
-                                   features=ref, # reference from the same speaker as the embedding
-                             embedding_mask_proba=0.1,
-                             num_steps=num_steps).squeeze(1)
-                    loss_diff = model.diffusion(s_trg.unsqueeze(1), embedding=bert_dur, features=ref).mean() # EDM loss
+                        embedding=bert_dur,
+                        embedding_scale=1,
+                        features=reference_styles, # reference from the same speaker as the embedding
+                        embedding_mask_proba=0.1,
+                        num_steps=num_steps).squeeze(1)
+                    loss_diff = model.diffusion(s_trg.unsqueeze(1), embedding=bert_dur, features=reference_styles).mean() # EDM loss
                     loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
                 else:
                     s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
@@ -310,13 +341,7 @@ def main(config_path):
                 loss_diff = 0
 
                 
-            s_loss = 0
-            
-
-            d, p = model.predictor(d_en, s_dur, 
-                                                    input_lengths, 
-                                                    s2s_attn_mono, 
-                                                    text_mask)
+            d, p = model.predictor(d_en, s_dur, input_lengths, s2s_attn_mono, text_mask)
                 
             mel_len_st = int(mel_input_length.min().item() / 2 - 1)
             mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
@@ -456,7 +481,7 @@ def main(config_path):
                                  waves, 
                                  mel_input_length,
                                  ref_texts, 
-                                 ref_lengths, use_ind, s_trg.detach(), ref if multispeaker else None)
+                                 ref_lengths, use_ind, s_trg.detach(), reference_styles if multispeaker else None)
 
                 if slm_out is not None:
                     d_loss_slm, loss_gen_lm, y_pred = slm_out
@@ -533,30 +558,27 @@ def main(config_path):
 
         with torch.no_grad():
             iters_test = 0
-            for batch_idx, batch in enumerate(val_dataloader):
+            for _, batch in enumerate(val_dataloader):
                 optimizer.zero_grad()
 
                 try:
                     waves = batch[0]
                     batch = [b.to(device) for b in batch[1:]]
                     texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
-                    with torch.no_grad():
-                        mask = length_to_mask(mel_input_length // (2 ** n_down)).to('cuda')
-                        text_mask = length_to_mask(input_lengths).to(texts.device)
+                    
+                    mel_mask, text_mask = create_masks(mel_input_length, input_lengths, n_down, device)
 
-                        _, _, s2s_attn = model.text_aligner(mels, mask, texts)
-                        s2s_attn = s2s_attn.transpose(-1, -2)
-                        s2s_attn = s2s_attn[..., 1:]
-                        s2s_attn = s2s_attn.transpose(-1, -2)
+                    _, _, s2s_attn = model.text_aligner(mels, mel_mask, texts)
+                    s2s_attn = process_attention_matrix(s2s_attn)
 
-                        mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
-                        s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
+                    mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
+                    s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
 
-                        # encode
-                        t_en = model.text_encoder(texts, input_lengths, text_mask)
-                        asr = (t_en @ s2s_attn_mono)
+                    # encode
+                    t_en = model.text_encoder(texts, input_lengths, text_mask)
+                    asr = (t_en @ s2s_attn_mono)
 
-                        d_gt = s2s_attn_mono.sum(axis=-1).detach()
+                    d_gt = s2s_attn_mono.sum(axis=-1).detach()
 
                     ss = []
                     gs = []
