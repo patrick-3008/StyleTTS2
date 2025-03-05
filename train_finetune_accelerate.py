@@ -1,31 +1,36 @@
-# load packages
+# Standard library imports
+import os
 import random
-import yaml
 import time
-from munch import Munch
+import warnings
+
+# Third-party imports
+import click
 import numpy as np
+import shutil
 import torch
 import torch.nn.functional as F
-import click
-import shutil
-import warnings
-warnings.simplefilter('ignore')
 import wandb
+import yaml
+from accelerate import Accelerator
+from munch import Munch
 
+# Suppress warnings for cleaner output
+warnings.simplefilter('ignore')
+
+# Local imports
 from meldataset import build_dataloader
-
 from Utils.PLBERT.util import load_plbert
-
 from models import *
 from losses import *
 from utils import *
-
 from Modules.slmadv import SLMAdversarialLoss
-from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
-
+from Modules.diffusion.sampler import (
+    DiffusionSampler,
+    ADPM2Sampler,
+    KarrasSchedule
+)
 from optimizers import build_optimizer
-
-from accelerate import Accelerator
 
 accelerator = Accelerator()
 
@@ -52,14 +57,14 @@ def main(config_path):
     config = yaml.safe_load(open(config_path))
     
     log_dir = config['log_dir']
-    if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
-    shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
+    if not os.path.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
+    shutil.copy(config_path, os.path.join(log_dir, os.path.basename(config_path)))
     
     # Initialize wandb
     wandb.init(project="style_tts2_finetune", config=config, dir=log_dir)
 
     # write logs
-    file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
+    file_handler = logging.FileHandler(os.path.join(log_dir, 'train.log'))
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
     logger.addHandler(file_handler)
@@ -141,7 +146,7 @@ def main(config_path):
     
     if not load_pretrained:
         if config.get('first_stage_path', '') != '':
-            first_stage_path = osp.join(log_dir, config.get('first_stage_path', 'first_stage.pth'))
+            first_stage_path = os.path.join(log_dir, config.get('first_stage_path', 'first_stage.pth'))
             print('Loading the first stage model at %s ...' % first_stage_path)
             model, _, start_epoch, iters = load_checkpoint(model, 
                 None, 
@@ -688,14 +693,14 @@ def main(config_path):
                 'val_loss': loss_test / iters_test,
                 'epoch': epoch,
             }
-            save_path = osp.join(log_dir, 'epoch_2nd_%05d.pth' % epoch)
+            save_path = os.path.join(log_dir, 'epoch_2nd_%05d.pth' % epoch)
             torch.save(state, save_path)
 
             # if estimate sigma, save the estimated simga
             if model_params.diffusion.dist.estimate_sigma_data:
                 config['model_params']['diffusion']['dist']['sigma_data'] = float(np.mean(running_std))
 
-                with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
+                with open(os.path.join(log_dir, os.path.basename(config_path)), 'w') as outfile:
                     yaml.dump(config, outfile, default_flow_style=True)
 
                             
