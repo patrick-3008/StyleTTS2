@@ -697,34 +697,13 @@ def main(config_path):
                     prosodic_styles, target_styles = compute_global_styles(model, mels, mel_input_lengths)
 
                     _, bert_output_encoded = encode_text_with_bert(model, texts, text_mask)
-                    duration_pred, p = model.predictor(bert_output_encoded, s, text_input_lengths, s2s_mono_attn, text_mask)
+                    duration_pred, feature_pred = model.predictor(bert_output_encoded, prosodic_styles, text_input_lengths, s2s_mono_attn, text_mask)
                     # get clips
-                    mel_len = int(mel_input_lengths.min().item() / 2 - 1)
-                    en = []
-                    gt = []
 
-                    p_en = []
-                    wav = []
+                    aligned_text_segments, predicted_feature_segments, ground_truth_mel_segments, ground_truth_waveform_segments = extract_training_segments(mel_input_lengths, aligned_text, feature_pred, mels, waves, device, config['max_len'])
+                    prosodic_segment_style = model.predictor_encoder(ground_truth_mel_segments.unsqueeze(1))
 
-                    for bib in range(len(mel_input_lengths)):
-                        mel_length = int(mel_input_lengths[bib].item() / 2)
-
-                        random_start = np.random.randint(0, mel_length - mel_len)
-                        en.append(aligned_text[bib, :, random_start:random_start+mel_len])
-                        p_en.append(p[bib, :, random_start:random_start+mel_len])
-
-                        gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
-                        y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
-                        wav.append(torch.from_numpy(y).to(device))
-
-                    wav = torch.stack(wav).float().detach()
-
-                    en = torch.stack(en)
-                    p_en = torch.stack(p_en)
-                    gt = torch.stack(gt).detach()
-                    s = model.predictor_encoder(gt.unsqueeze(1))
-
-                    F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s)
+                    F0_fake, N_fake = model.predictor.F0Ntrain(predicted_feature_segments, prosodic_segment_style)
 
                     loss_dur = 0
                     for _s2s_pred, _text_input, _text_length in zip(duration_pred, (duration_ground_truth), text_input_lengths):
@@ -739,12 +718,12 @@ def main(config_path):
 
                     loss_dur /= texts.size(0)
 
-                    s = model.style_encoder(gt.unsqueeze(1))
+                    acoustic_segment_style = model.style_encoder(ground_truth_mel_segments.unsqueeze(1))
 
-                    y_rec = model.decoder(en, F0_fake, N_fake, s)
-                    loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
+                    y_rec = model.decoder(aligned_text_segments, F0_fake, N_fake, acoustic_segment_style)
+                    loss_mel = stft_loss(y_rec.squeeze(), ground_truth_waveform_segments.detach())
 
-                    F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1)) 
+                    F0_real, _, F0 = model.pitch_extractor(ground_truth_mel_segments.unsqueeze(1)) 
 
                     loss_F0 = F.l1_loss(F0_real, F0_fake) / 10
 
