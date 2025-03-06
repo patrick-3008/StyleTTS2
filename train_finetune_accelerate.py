@@ -137,7 +137,7 @@ def setup_optimizer(model, optimizer_params, epochs, train_dataloader):
             
     return optimizer
 
-def setup_losses_and_sampler(model, model_params, slmadv_params, sr, device, sampler):
+def setup_losses(model, model_params, slmadv_params, sr, device, sampler):
     """Set up loss functions and diffusion sampler."""
     generator_loss = MyDataParallel(GeneratorLoss(model.mpd, model.msd).to(device))
     discriminator_loss = MyDataParallel(DiscriminatorLoss(model.mpd, model.msd).to(device))
@@ -147,7 +147,7 @@ def setup_losses_and_sampler(model, model_params, slmadv_params, sr, device, sam
    
     slmadv = SLMAdversarialLoss(model, wavlm_loss, sampler, **slmadv_params)
     
-    return generator_loss, discriminator_loss, wavlm_loss, stft_loss, slmadv, sampler
+    return generator_loss, discriminator_loss, wavlm_loss, stft_loss, slmadv
 
 def compute_reference_styles(model, ref_mels):
     """Compute reference styles for multispeaker training with no gradient tracking."""
@@ -156,10 +156,10 @@ def compute_reference_styles(model, ref_mels):
         ref_prosodic_style = model.predictor_encoder(ref_mels.unsqueeze(1))
         return torch.cat([ref_acoustic_style, ref_prosodic_style], dim=1)
 
-def create_masks(mel_input_length, input_lengths, n_down, device):
+def create_masks(mel_input_lengths, input_lengths, n_down, device):
     """Create masks for text and mel inputs based on their lengths."""
     with torch.no_grad():
-        mel_mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
+        mel_mask = length_to_mask(mel_input_lengths // (2 ** n_down)).to(device)
         text_mask = length_to_mask(input_lengths).to(device)
     return mel_mask, text_mask
 
@@ -250,7 +250,7 @@ def train_diffusion(model, model_params, sampler, s_trg, bert_dur, ref_mels=None
     
     return loss_diff, loss_sty, sigma_data
 
-def align_text_to_speech(model, texts, input_lengths, mel_input_length, s2s_attn, text_mask, n_down):
+def align_text_to_speech(model, texts, input_lengths, mel_input_lengths, s2s_attn, text_mask, n_down):
     """
     Aligns encoded text to speech using attention matrices and computes durations.
     
@@ -258,7 +258,7 @@ def align_text_to_speech(model, texts, input_lengths, mel_input_length, s2s_attn
         model: The model containing text_encoder
         texts: Input text tokens
         input_lengths: Lengths of input texts
-        mel_input_length: Lengths of mel spectrograms
+        mel_input_lengths: Lengths of mel spectrograms
         s2s_attn: Speech-to-text attention matrix
         text_mask: Mask for text inputs
         n_down: Downsampling factor
@@ -267,7 +267,7 @@ def align_text_to_speech(model, texts, input_lengths, mel_input_length, s2s_attn
         tuple: (aligned_text_features, monotonic_attention, duration_gt) - 
                aligned text features, monotonic attention matrix, and ground truth durations
     """
-    mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
+    mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_lengths // (2 ** n_down))
     monotonic_attention = maximum_path(s2s_attn, mask_ST)
 
     # encode text
@@ -283,7 +283,7 @@ def align_text_to_speech(model, texts, input_lengths, mel_input_length, s2s_attn
     
     return aligned_text_features, monotonic_attention, duration_gt
 
-def compute_global_styles(model, mels, mel_input_length):
+def compute_global_styles(model, mels, mel_input_lengths):
     """
     Compute global acoustic and prosodic styles for each mel spectrogram in the batch.
     
@@ -292,7 +292,7 @@ def compute_global_styles(model, mels, mel_input_length):
     Args:
         model: The model containing style_encoder and predictor_encoder
         mels: Batch of mel spectrograms
-        mel_input_length: Lengths of mel spectrograms
+        mel_input_lengths: Lengths of mel spectrograms
         
     Returns:
         tuple: (s_dur, gs, s_trg) - prosodic styles, acoustic styles, and combined target styles
@@ -300,8 +300,8 @@ def compute_global_styles(model, mels, mel_input_length):
     prosodic_styles = []
     acoustic_styles = []
     
-    for i in range(len(mel_input_length)):
-        mel = mels[i, :, :mel_input_length[i]]
+    for i in range(len(mel_input_lengths)):
+        mel = mels[i, :, :mel_input_lengths[i]]
         
         # Extract prosodic style
         prosodic_style = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
@@ -339,12 +339,12 @@ def encode_text_with_bert(model, texts, text_mask):
     bert_output_encoded = model.bert_encoder(bert_output).transpose(-1, -2)
     return bert_output, bert_output_encoded
 
-def extract_training_segments(mel_input_length, aligned_text, p, mels, waves, device, max_len):
+def extract_training_segments(mel_input_lengths, aligned_text, p, mels, waves, device, max_len):
     """
     Extract random segments from mel spectrograms and audio waveforms for training.
     
     Args:
-        mel_input_length: Lengths of mel spectrograms in the batch
+        mel_input_lengths: Lengths of mel spectrograms in the batch
         aligned_text: Text features aligned with speech
         p: Predicted features from the predictor
         mels: Mel spectrograms
@@ -361,7 +361,7 @@ def extract_training_segments(mel_input_length, aligned_text, p, mels, waves, de
         )
     """
     # Calculate segment lengths
-    content_segment_length = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
+    content_segment_length = min(int(mel_input_lengths.min().item() / 2 - 1), max_len // 2)
     
     # Initialize empty lists for collecting segments
     aligned_text_segments = []
@@ -370,8 +370,8 @@ def extract_training_segments(mel_input_length, aligned_text, p, mels, waves, de
     ground_truth_waveform_segments = []
     
     # Extract segments for each sample in the batch
-    for batch_idx in range(len(mel_input_length)):
-        mel_length = int(mel_input_length[batch_idx].item() / 2)
+    for batch_idx in range(len(mel_input_lengths)):
+        mel_length = int(mel_input_lengths[batch_idx].item() / 2)
 
         # Select random starting point for content segments
         content_random_start = np.random.randint(0, mel_length - content_segment_length)
@@ -408,9 +408,6 @@ def main(config_path):
     epochs = config['epochs']
     
     loss_params = Munch(config['loss_params'])
-    diffusion_training_epoch = loss_params.diffusion_training_epoch
-    joint_training_epoch = loss_params.joint_training_epoch
-    
     optimizer_params = Munch(config['optimizer_params'])
     
     # Set up logging
@@ -440,16 +437,15 @@ def main(config_path):
  
     # Set up losses and sampler
     slmadv_params = config['slmadv_params']
-    generator_loss, discriminator_loss, wavlm_loss, stft_loss, slmadv, sampler = setup_losses_and_sampler(
+    generator_loss, discriminator_loss, wavlm_loss, stft_loss, slmadv = setup_losses(
         model, model_params, slmadv_params, config['preprocess_params']['sr'], device, sampler
     )
     
     # Set up optimizer with appropriate learning rates
     optimizer = setup_optimizer(model, optimizer_params, epochs, train_dataloader)
-    model, optimizer, start_epoch, _ = load_checkpoint(model, optimizer, config['pretrained_model'], load_only_params=config['load_only_params'])
+    model, optimizer, _, _ = load_checkpoint(model, optimizer, config['pretrained_model'], load_only_params=config['load_only_params'])
 
     n_down = model.text_aligner.n_down
-
     best_loss = float('inf'); iters = 0; running_std = []
    
     model, optimizer, train_dataloader = accelerator.prepare(
@@ -458,7 +454,7 @@ def main(config_path):
 
     torch.cuda.empty_cache()
 
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(epochs):
         running_loss = 0
 
         _ = [model[key].eval() for key in model]
@@ -466,9 +462,9 @@ def main(config_path):
         
         for i, batch in enumerate(train_dataloader):
             _ = [b.to(device) for i, b in enumerate(batch) if i > 0]
-            waves, texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
+            waves, texts, text_input_lengths, ood_texts, ood_text_lengths, mels, mel_input_lengths, ref_mels = batch
 
-            mel_mask, text_mask = create_masks(mel_input_length, input_lengths, n_down, device)
+            mel_mask, text_mask = create_masks(mel_input_lengths, text_input_lengths, n_down, device)
 
             try:
                 _, s2s_pred, s2s_attn = model.text_aligner(mels, mel_mask, texts)
@@ -476,15 +472,15 @@ def main(config_path):
             except:
                 continue
 
-            aligned_text, s2s_attn_mono, d_gt = align_text_to_speech(model, texts, input_lengths, mel_input_length, s2s_attn, text_mask, n_down)
+            aligned_text, s2s_attn_mono, d_gt = align_text_to_speech(model, texts, text_input_lengths, mel_input_lengths, s2s_attn, text_mask, n_down)
 
             # Compute global styles
-            prosodic_styles, target_styles = compute_global_styles(model, mels, mel_input_length)
+            prosodic_styles, target_styles = compute_global_styles(model, mels, mel_input_lengths)
 
             bert_output, bert_output_encoded = encode_text_with_bert(model, texts, text_mask)
             
             # denoiser training
-            if epoch >= diffusion_training_epoch:
+            if epoch >= loss_params.diffusion_training_epoch:
                 loss_diff, loss_sty, sigma_data = train_diffusion(model, model_params, sampler, target_styles, bert_output, ref_mels if multispeaker else None, device)
                 
                 if sigma_data is not None:
@@ -493,9 +489,9 @@ def main(config_path):
                 loss_sty = 0
                 loss_diff = 0
 
-            d, p = model.predictor(bert_output_encoded, prosodic_styles, input_lengths, s2s_attn_mono, text_mask)
+            d, p = model.predictor(bert_output_encoded, prosodic_styles, text_input_lengths, s2s_attn_mono, text_mask)
                 
-            aligned_text_segments, predicted_feature_segments, ground_truth_mel_segments, ground_truth_waveform_segments = extract_training_segments(mel_input_length, aligned_text, p, mels, waves, device, config['max_len'])
+            aligned_text_segments, predicted_feature_segments, ground_truth_mel_segments, ground_truth_waveform_segments = extract_training_segments(mel_input_lengths, aligned_text, p, mels, waves, device, config['max_len'])
 
             if ground_truth_mel_segments.size(-1) < 80:
                 continue
@@ -537,7 +533,7 @@ def main(config_path):
 
             loss_ce = 0
             loss_dur = 0
-            for _s2s_pred, _text_input, _text_length in zip(d, (d_gt), input_lengths):
+            for _s2s_pred, _text_input, _text_length in zip(d, (d_gt), text_input_lengths):
                 _s2s_pred = _s2s_pred[:_text_length, :]
                 _text_input = _text_input[:_text_length].long()
                 _s2s_trg = torch.zeros_like(_s2s_pred)
@@ -553,7 +549,7 @@ def main(config_path):
             loss_dur /= texts.size(0)
             
             loss_s2s = 0
-            for _s2s_pred, _text_input, _text_length in zip(s2s_pred, texts, input_lengths):
+            for _s2s_pred, _text_input, _text_length in zip(s2s_pred, texts, text_input_lengths):
                 loss_s2s += F.cross_entropy(_s2s_pred[:_text_length], _text_input[:_text_length])
             loss_s2s /= texts.size(0)
 
@@ -584,11 +580,11 @@ def main(config_path):
             optimizer.step('text_encoder')
             optimizer.step('text_aligner')
             
-            if epoch >= diffusion_training_epoch:
+            if epoch >= loss_params.diffusion_training_epoch:
                 optimizer.step('diffusion')
 
             d_loss_slm, loss_gen_lm = 0, 0
-            if epoch >= joint_training_epoch:
+            if epoch >= loss_params.joint_training_epoch:
                 # randomly pick whether to use in-distribution text
                 if np.random.rand() < 0.5:
                     use_ind = True
@@ -596,16 +592,16 @@ def main(config_path):
                     use_ind = False
 
                 if use_ind:
-                    ref_lengths = input_lengths
-                    ref_texts = texts
+                    ood_text_lengths = text_input_lengths
+                    ood_texts = texts
                     
                 slm_out = slmadv(i, 
                                  ground_truth_waveform_segments, 
                                  reconstructed_waveform_segments, 
                                  waves, 
-                                 mel_input_length,
-                                 ref_texts, 
-                                 ref_lengths, use_ind, target_styles, compute_reference_styles(model, ref_mels) if multispeaker else None)
+                                 mel_input_lengths,
+                                 ood_texts, 
+                                 ood_text_lengths, use_ind, target_styles, compute_reference_styles(model, ref_mels) if multispeaker else None)
 
                 if slm_out is not None:
                     d_loss_slm, loss_gen_lm, _ = slm_out
@@ -689,30 +685,30 @@ def main(config_path):
                 try:
                     waves = batch[0]
                     batch = [b.to(device) for b in batch[1:]]
-                    texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
+                    texts, text_input_lengths, ood_texts, ood_text_lengths, mels, mel_input_lengths, ref_mels = batch
                     
-                    mel_mask, text_mask = create_masks(mel_input_length, input_lengths, n_down, device)
+                    mel_mask, text_mask = create_masks(mel_input_lengths, text_input_lengths, n_down, device)
 
                     _, _, s2s_attn = model.text_aligner(mels, mel_mask, texts)
                     s2s_attn = process_attention_matrix(s2s_attn)
 
-                    aligned_text, s2s_attn_mono, d_gt = align_text_to_speech(model, texts, input_lengths, mel_input_length, s2s_attn, text_mask, n_down)
+                    aligned_text, s2s_attn_mono, d_gt = align_text_to_speech(model, texts, text_input_lengths, mel_input_lengths, s2s_attn, text_mask, n_down)
 
                     # Compute global styles
-                    prosodic_styles, target_styles = compute_global_styles(model, mels, mel_input_length)
+                    prosodic_styles, target_styles = compute_global_styles(model, mels, mel_input_lengths)
 
                     _, bert_output_encoded = encode_text_with_bert(model, texts, text_mask)
-                    d, p = model.predictor(bert_output_encoded, s, input_lengths, s2s_attn_mono, text_mask)
+                    d, p = model.predictor(bert_output_encoded, s, text_input_lengths, s2s_attn_mono, text_mask)
                     # get clips
-                    mel_len = int(mel_input_length.min().item() / 2 - 1)
+                    mel_len = int(mel_input_lengths.min().item() / 2 - 1)
                     en = []
                     gt = []
 
                     p_en = []
                     wav = []
 
-                    for bib in range(len(mel_input_length)):
-                        mel_length = int(mel_input_length[bib].item() / 2)
+                    for bib in range(len(mel_input_lengths)):
+                        mel_length = int(mel_input_lengths[bib].item() / 2)
 
                         random_start = np.random.randint(0, mel_length - mel_len)
                         en.append(aligned_text[bib, :, random_start:random_start+mel_len])
@@ -732,7 +728,7 @@ def main(config_path):
                     F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s)
 
                     loss_dur = 0
-                    for _s2s_pred, _text_input, _text_length in zip(d, (d_gt), input_lengths):
+                    for _s2s_pred, _text_input, _text_length in zip(d, (d_gt), text_input_lengths):
                         _s2s_pred = _s2s_pred[:_text_length, :]
                         _text_input = _text_input[:_text_length].long()
                         _s2s_trg = torch.zeros_like(_s2s_pred)
