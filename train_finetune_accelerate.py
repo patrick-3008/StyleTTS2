@@ -398,6 +398,125 @@ def extract_training_segments(mel_input_lengths, aligned_text, feature_pred, mel
         ground_truth_waveform_segments
         )
 
+def compute_duration_losses(duration_predictions, duration_ground_truth, text_lengths):
+    """
+    Compute duration-related losses for speech synthesis training.
+    
+    Args:
+        duration_predictions: Predicted duration logits for each text token (batch_size, max_text_len, 1)
+        duration_ground_truth: Ground truth duration values (batch_size, max_text_len)
+        text_lengths: Length of each text sequence in the batch (batch_size,)
+    
+    Returns:
+        tuple: (cross_entropy_loss, duration_loss) - BCE loss and L1 loss for durations
+    """
+    batch_size = len(text_lengths)
+    cross_entropy_loss = 0
+    duration_loss = 0
+    
+    for pred_logits, true_duration, text_len in zip(duration_predictions, duration_ground_truth, text_lengths):
+        # Trim to actual sequence length
+        pred_logits = pred_logits[:text_len, :]
+        true_duration = true_duration[:text_len].long()
+        
+        # Create binary target matrix
+        duration_target = torch.zeros_like(pred_logits)
+        for token_idx in range(duration_target.shape[0]):
+            duration_target[token_idx, :true_duration[token_idx]] = 1
+            
+        # Compute predicted durations by applying sigmoid and summing
+        pred_durations = torch.sigmoid(pred_logits).sum(axis=1)
+        
+        # Calculate losses (excluding first and last tokens)
+        duration_loss += F.l1_loss(pred_durations[1:text_len-1], 
+                                 true_duration[1:text_len-1])
+        cross_entropy_loss += F.binary_cross_entropy_with_logits(
+            pred_logits.flatten(), duration_target.flatten())
+    
+    # Average losses over batch
+    return cross_entropy_loss / batch_size, duration_loss / batch_size
+
+def compute_alignment_losses(speech_to_text_predictions, input_texts, text_lengths, soft_attention, monotonic_attention):
+    """
+    Compute speech-to-text alignment losses for both cross entropy and monotonicity.
+    
+    Args:
+        speech_to_text_predictions: Predicted text tokens from speech (batch_size, max_len, vocab_size)
+        input_texts: Ground truth text tokens (batch_size, max_len)
+        text_lengths: Length of each text sequence in the batch (batch_size,)
+        soft_attention: Soft attention alignment matrix
+        monotonic_attention: Monotonic attention alignment matrix
+    
+    Returns:
+        tuple: (cross_entropy_loss, monotonicity_loss) - Cross entropy loss for text prediction
+            and L1 loss between soft and monotonic attention
+    """
+    # Compute cross entropy loss for speech-to-text prediction
+    cross_entropy_loss = 0
+    for prediction, text, length in zip(speech_to_text_predictions, input_texts, text_lengths):
+        # Only compute loss up to the actual sequence length
+        cross_entropy_loss += F.cross_entropy(prediction[:length], text[:length])
+    cross_entropy_loss /= input_texts.size(0)  # Average over batch
+    
+    # Compute monotonicity loss between soft and monotonic attention
+    monotonicity_loss = F.l1_loss(soft_attention, monotonic_attention) * 10
+    
+    return cross_entropy_loss, monotonicity_loss
+
+def compute_generator_loss(loss_params, losses):
+    """
+    Compute the total generator loss by combining individual losses with their respective weights.
+    
+    Args:
+        loss_params: Munch object containing loss weights (lambda parameters)
+        losses: dict containing individual loss components:
+            - loss_mel: Mel-spectrogram reconstruction loss
+            - loss_F0_rec: F0 reconstruction loss
+            - loss_ce: Cross entropy loss
+            - loss_norm_rec: Norm reconstruction loss
+            - loss_dur: Duration prediction loss
+            - loss_gen_all: Generator adversarial loss
+            - loss_lm: WavLM loss
+            - loss_sty: Style reconstruction loss
+            - loss_diff: Diffusion loss
+            - loss_mono: Monotonicity loss
+            - loss_s2s: Speech-to-text loss
+            
+    Returns:
+        total_loss: Weighted sum of all loss components
+    """
+    return (loss_params.lambda_mel * losses['loss_mel'] + 
+            loss_params.lambda_F0 * losses['loss_F0_rec'] + 
+            loss_params.lambda_ce * losses['loss_ce'] + 
+            loss_params.lambda_norm * losses['loss_norm_rec'] + 
+            loss_params.lambda_dur * losses['loss_dur'] + 
+            loss_params.lambda_gen * losses['loss_gen_all'] + 
+            loss_params.lambda_slm * losses['loss_lm'] + 
+            loss_params.lambda_sty * losses['loss_sty'] + 
+            loss_params.lambda_diff * losses['loss_diff'] + 
+            loss_params.lambda_mono * losses['loss_mono'] + 
+            loss_params.lambda_s2s * losses['loss_s2s'])
+
+def step_main_optimizers(optimizer, diffusion=False):
+    """
+    Execute optimizer steps for main model components.
+    
+    Args:
+        optimizer: The optimizer object
+        diffusion: Whether to include diffusion step (default: False)
+    """
+    optimizer.step('bert_encoder')
+    optimizer.step('bert')
+    optimizer.step('predictor')
+    optimizer.step('predictor_encoder')
+    optimizer.step('style_encoder')
+    optimizer.step('decoder')
+    optimizer.step('text_encoder')
+    optimizer.step('text_aligner')
+    
+    if diffusion:
+        optimizer.step('diffusion')
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -455,7 +574,7 @@ def main(config_path):
     torch.cuda.empty_cache()
 
     for epoch in range(epochs):
-        running_loss = 0
+        running_mel_loss = 0
 
         _ = [model[key].eval() for key in model]
         _ = [model[key].train() for key in ['text_aligner', 'text_encoder', 'predictor', 'bert_encoder', 'bert', 'msd', 'mpd']]
@@ -487,10 +606,10 @@ def main(config_path):
                 continue
 
             aligned_text, s2s_mono_attn, duration_ground_truth = align_text_to_speech(model, texts, text_input_lengths, mel_input_lengths, s2s_soft_attn, text_mask, n_down)
-
             duration_pred, feature_pred = model.predictor(bert_output_encoded, prosodic_styles, text_input_lengths, s2s_mono_attn, text_mask)
                 
-            aligned_text_segments, predicted_feature_segments, ground_truth_mel_segments, ground_truth_waveform_segments = extract_training_segments(mel_input_lengths, aligned_text, feature_pred, mels, waves, device, config['max_len'])
+            aligned_text_segments, predicted_feature_segments, ground_truth_mel_segments, \
+            ground_truth_waveform_segments = extract_training_segments(mel_input_lengths, aligned_text, feature_pred, mels, waves, device, config['max_len'])
 
             if ground_truth_mel_segments.size(-1) < 80:
                 continue
@@ -528,59 +647,33 @@ def main(config_path):
             loss_lm = wavlm_loss(
                 ground_truth_waveform_segments.squeeze(tuple(range(1, len(ground_truth_waveform_segments.shape)))), 
                 reconstructed_waveform_all_the_way.squeeze(tuple(range(1, len(reconstructed_waveform_all_the_way.shape))))
-            ).mean()
+            ).mean() # Curious to see WavLM getting finetuned with the decoder
 
-            loss_ce = 0
-            loss_dur = 0
-            for _s2s_pred, _text_input, _text_length in zip(duration_pred, (duration_ground_truth), text_input_lengths):
-                _s2s_pred = _s2s_pred[:_text_length, :]
-                _text_input = _text_input[:_text_length].long()
-                _s2s_trg = torch.zeros_like(_s2s_pred)
-                for p in range(_s2s_trg.shape[0]):
-                    _s2s_trg[p, :_text_input[p]] = 1
-                _dur_pred = torch.sigmoid(_s2s_pred).sum(axis=1)
-
-                loss_dur += F.l1_loss(_dur_pred[1:_text_length-1], 
-                                       _text_input[1:_text_length-1])
-                loss_ce += F.binary_cross_entropy_with_logits(_s2s_pred.flatten(), _s2s_trg.flatten())
-
-            loss_ce /= texts.size(0)
-            loss_dur /= texts.size(0)
+            loss_ce, loss_dur = compute_duration_losses(
+                duration_pred, duration_ground_truth, text_input_lengths)
             
-            loss_s2s = 0
-            for _s2s_pred, _text_input, _text_length in zip(s2s_pred, texts, text_input_lengths):
-                loss_s2s += F.cross_entropy(_s2s_pred[:_text_length], _text_input[:_text_length])
-            loss_s2s /= texts.size(0)
+            loss_s2s, loss_mono = compute_alignment_losses(
+                s2s_pred, texts, text_input_lengths, s2s_soft_attn, s2s_mono_attn)
 
-            loss_mono = F.l1_loss(s2s_soft_attn, s2s_mono_attn) * 10
+            losses = {
+                'loss_mel': loss_mel,
+                'loss_F0_rec': loss_F0_rec,
+                'loss_ce': loss_ce,
+                'loss_norm_rec': loss_norm_rec,
+                'loss_dur': loss_dur,
+                'loss_gen_all': loss_gen_all,
+                'loss_lm': loss_lm,
+                'loss_sty': loss_sty,
+                'loss_diff': loss_diff,
+                'loss_mono': loss_mono,
+                'loss_s2s': loss_s2s
+            }
+            tts_loss = compute_generator_loss(loss_params, losses)
+            
+            running_mel_loss += loss_mel.item()
+            accelerator.backward(tts_loss)
 
-            g_loss = loss_params.lambda_mel * loss_mel + \
-                     loss_params.lambda_F0 * loss_F0_rec + \
-                     loss_params.lambda_ce * loss_ce + \
-                     loss_params.lambda_norm * loss_norm_rec + \
-                     loss_params.lambda_dur * loss_dur + \
-                     loss_params.lambda_gen * loss_gen_all + \
-                     loss_params.lambda_slm * loss_lm + \
-                     loss_params.lambda_sty * loss_sty + \
-                     loss_params.lambda_diff * loss_diff + \
-                    loss_params.lambda_mono * loss_mono + \
-                    loss_params.lambda_s2s * loss_s2s
-            
-            running_loss += loss_mel.item()
-            accelerator.backward(g_loss)
-
-            optimizer.step('bert_encoder')
-            optimizer.step('bert')
-            optimizer.step('predictor')
-            optimizer.step('predictor_encoder')
-            optimizer.step('style_encoder')
-            optimizer.step('decoder')
-            
-            optimizer.step('text_encoder')
-            optimizer.step('text_aligner')
-            
-            if epoch >= loss_params.diffusion_training_epoch:
-                optimizer.step('diffusion')
+            step_main_optimizers(optimizer, diffusion=(epoch >= loss_params.diffusion_training_epoch))
 
             d_loss_slm, loss_gen_lm = 0, 0
             if epoch >= loss_params.joint_training_epoch:
@@ -655,7 +748,7 @@ def main(config_path):
             if (i+1)%log_interval == 0:
                 # Log metrics to wandb
                 wandb.log({
-                    'train/mel_loss': running_loss / log_interval,
+                    'train/mel_loss': running_mel_loss / log_interval,
                     'train/gen_loss': loss_gen_all,
                     'train/d_loss': d_loss,
                     'train/ce_loss': loss_ce,
@@ -669,7 +762,7 @@ def main(config_path):
                     'train/gen_loss_slm': loss_gen_lm,
                 })
                 
-                running_loss = 0
+                running_mel_loss = 0
             
         loss_test = 0
         loss_align = 0
@@ -697,8 +790,8 @@ def main(config_path):
                     prosodic_styles, target_styles = compute_global_styles(model, mels, mel_input_lengths)
 
                     _, bert_output_encoded = encode_text_with_bert(model, texts, text_mask)
-                    duration_pred, feature_pred = model.predictor(bert_output_encoded, prosodic_styles, text_input_lengths, s2s_mono_attn, text_mask)
-                    # get clips
+                    # Using s2s_mono_attn has already seen the mel which is is suspicious
+                    duration_pred, feature_pred = model.predictor(bert_output_encoded, prosodic_styles, text_input_lengths, s2s_mono_attn, text_mask) 
 
                     aligned_text_segments, predicted_feature_segments, ground_truth_mel_segments, ground_truth_waveform_segments = extract_training_segments(mel_input_lengths, aligned_text, feature_pred, mels, waves, device, config['max_len'])
                     prosodic_segment_style = model.predictor_encoder(ground_truth_mel_segments.unsqueeze(1))
