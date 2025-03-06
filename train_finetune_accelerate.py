@@ -405,13 +405,7 @@ def main(config_path):
     
     # Extract configuration parameters
     log_dir = config['log_dir']
-    batch_size = config['batch_size']
     epochs = config['epochs']
-    save_freq = config['save_freq']
-    log_interval = config['log_interval']
-    data_params = config['data_params']
-    sr = config['preprocess_params']['sr']
-    max_len = config['max_len']
     
     loss_params = Munch(config['loss_params'])
     diffusion_training_epoch = loss_params.diffusion_training_epoch
@@ -426,7 +420,7 @@ def main(config_path):
     device = accelerator.device
     
     # Set up dataloaders
-    train_dataloader, val_dataloader = setup_dataloaders(data_params, batch_size, device)
+    train_dataloader, val_dataloader = setup_dataloaders(config['data_params'], config['batch_size'], device)
     
     # Load pretrained models
     text_aligner, pitch_extractor, plbert = load_pretrained_models(config, device)
@@ -447,7 +441,7 @@ def main(config_path):
     # Set up losses and sampler
     slmadv_params = config['slmadv_params']
     generator_loss, discriminator_loss, wavlm_loss, stft_loss, slmadv, sampler = setup_losses_and_sampler(
-        model, model_params, slmadv_params, sr, device, sampler
+        model, model_params, slmadv_params, config['preprocess_params']['sr'], device, sampler
     )
     
     # Set up optimizer with appropriate learning rates
@@ -501,7 +495,7 @@ def main(config_path):
 
             d, p = model.predictor(bert_output_encoded, prosodic_styles, input_lengths, s2s_attn_mono, text_mask)
                 
-            aligned_text_segments, predicted_feature_segments, ground_truth_mel_segments, ground_truth_waveform_segments = extract_training_segments(mel_input_length, aligned_text, p, mels, waves, device, max_len)
+            aligned_text_segments, predicted_feature_segments, ground_truth_mel_segments, ground_truth_waveform_segments = extract_training_segments(mel_input_length, aligned_text, p, mels, waves, device, config['max_len'])
 
             if ground_truth_mel_segments.size(-1) < 80:
                 continue
@@ -661,7 +655,8 @@ def main(config_path):
                         optimizer.step('wd')
 
             iters = iters + 1
-            
+
+            log_interval = config['log_interval']
             if (i+1)%log_interval == 0:
                 # Log metrics to wandb
                 wandb.log({
@@ -773,7 +768,7 @@ def main(config_path):
             'eval/F0_loss': loss_f / iters_test
         }, step=epoch + 1)
         
-        if (epoch + 1) % save_freq == 0 :
+        if (epoch + 1) % config['save_freq'] == 0 :
             if (loss_test / iters_test) < best_loss:
                 best_loss = loss_test / iters_test
             print('Saving..')
