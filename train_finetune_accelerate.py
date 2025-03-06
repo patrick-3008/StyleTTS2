@@ -517,6 +517,64 @@ def step_main_optimizers(optimizer, diffusion=False):
     if diffusion:
         optimizer.step('diffusion')
 
+def train_slm_adversarial(use_ind, ood_text_lengths, ood_texts, model, optimizer, slmadv, slmadv_params, batch_idx, ground_truth_waveform_segments, 
+                          reconstructed_waveform_segments, waves, mel_input_lengths, ref_mels, target_styles, multispeaker):
+    """
+    Perform Speech Language Model (SLM) adversarial training step.
+    """
+    d_loss_slm, loss_gen_lm = 0, 0
+    slm_out = slmadv(batch_idx, ground_truth_waveform_segments, reconstructed_waveform_segments, waves, mel_input_lengths,
+                        ood_texts, ood_text_lengths, use_ind, target_styles, compute_reference_styles(model, ref_mels) if multispeaker else None)
+    
+    if slm_out is not None:
+        d_loss_slm, loss_gen_lm, _ = slm_out
+
+        # SLM generator loss
+        optimizer.zero_grad()
+        accelerator.backward(loss_gen_lm)
+
+        # compute the gradient norm
+        total_norm = {}
+        for key in model.keys():
+            total_norm[key] = 0
+            parameters = [p for p in model[key].parameters() if p.grad is not None and p.requires_grad]
+            for p in parameters:
+                param_norm = p.grad.detach().data.norm(2)
+                total_norm[key] += param_norm.item() ** 2
+            total_norm[key] = total_norm[key] ** 0.5
+
+        # gradient scaling
+        if total_norm['predictor'] > slmadv_params['thresh']:
+            for key in model.keys():
+                for p in model[key].parameters():
+                    if p.grad is not None:
+                        p.grad *= (1 / total_norm['predictor'])
+
+        for p in model.predictor.duration_proj.parameters():
+            if p.grad is not None:
+                p.grad *= slmadv_params['scale']
+
+        for p in model.predictor.lstm.parameters():
+            if p.grad is not None:
+                p.grad *= slmadv_params['scale']
+
+        for p in model.diffusion.parameters():
+            if p.grad is not None:
+                p.grad *= slmadv_params['scale']
+        
+        optimizer.step('bert_encoder')
+        optimizer.step('bert')
+        optimizer.step('predictor')
+        optimizer.step('diffusion')
+
+        # SLM discriminator loss
+        if d_loss_slm != 0:
+            optimizer.zero_grad()
+            accelerator.backward(d_loss_slm)
+            optimizer.step('wd')
+
+    return d_loss_slm, loss_gen_lm
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -579,7 +637,7 @@ def main(config_path):
         _ = [model[key].eval() for key in model]
         _ = [model[key].train() for key in ['text_aligner', 'text_encoder', 'predictor', 'bert_encoder', 'bert', 'msd', 'mpd']]
         
-        for i, batch in enumerate(train_dataloader):
+        for batch_idx, batch in enumerate(train_dataloader):
             _ = [b.to(device) for i, b in enumerate(batch) if i > 0]
             waves, texts, text_input_lengths, ood_texts, ood_text_lengths, mels, mel_input_lengths, ref_mels = batch
 
@@ -675,77 +733,20 @@ def main(config_path):
 
             step_main_optimizers(optimizer, diffusion=(epoch >= loss_params.diffusion_training_epoch))
 
-            d_loss_slm, loss_gen_lm = 0, 0
+            (use_ind, ood_text_lengths, ood_texts) = (True, text_input_lengths, texts) if np.random.rand() < 0.5 else (False, ood_text_lengths, ood_texts)
+
             if epoch >= loss_params.joint_training_epoch:
-                # randomly pick whether to use in-distribution text
-                if np.random.rand() < 0.5:
-                    use_ind = True
-                else:
-                    use_ind = False
+                d_loss_slm, loss_gen_lm = train_slm_adversarial(
+                    use_ind, ood_text_lengths, ood_texts, model, optimizer, slmadv, slmadv_params, batch_idx, ground_truth_waveform_segments, 
+                    reconstructed_waveform_segments, waves, mel_input_lengths, ref_mels, target_styles, multispeaker)
+            else:
+                d_loss_slm = 0
+                loss_gen_lm = 0
 
-                if use_ind:
-                    ood_text_lengths = text_input_lengths
-                    ood_texts = texts
-                    
-                slm_out = slmadv(i, 
-                                 ground_truth_waveform_segments, 
-                                 reconstructed_waveform_segments, 
-                                 waves, 
-                                 mel_input_lengths,
-                                 ood_texts, 
-                                 ood_text_lengths, use_ind, target_styles, compute_reference_styles(model, ref_mels) if multispeaker else None)
-
-                if slm_out is not None:
-                    d_loss_slm, loss_gen_lm, _ = slm_out
-
-                    # SLM generator loss
-                    optimizer.zero_grad()
-                    accelerator.backward(loss_gen_lm)
-
-                    # compute the gradient norm
-                    total_norm = {}
-                    for key in model.keys():
-                        total_norm[key] = 0
-                        parameters = [p for p in model[key].parameters() if p.grad is not None and p.requires_grad]
-                        for p in parameters:
-                            param_norm = p.grad.detach().data.norm(2)
-                            total_norm[key] += param_norm.item() ** 2
-                        total_norm[key] = total_norm[key] ** 0.5
-
-                    # gradient scaling
-                    if total_norm['predictor'] > slmadv_params['thresh']:
-                        for key in model.keys():
-                            for p in model[key].parameters():
-                                if p.grad is not None:
-                                    p.grad *= (1 / total_norm['predictor'])
-
-                    for p in model.predictor.duration_proj.parameters():
-                        if p.grad is not None:
-                            p.grad *= slmadv_params['scale']
-
-                    for p in model.predictor.lstm.parameters():
-                        if p.grad is not None:
-                            p.grad *= slmadv_params['scale']
-
-                    for p in model.diffusion.parameters():
-                        if p.grad is not None:
-                            p.grad *= slmadv_params['scale']
-                    
-                    optimizer.step('bert_encoder')
-                    optimizer.step('bert')
-                    optimizer.step('predictor')
-                    optimizer.step('diffusion')
-
-                    # SLM discriminator loss
-                    if d_loss_slm != 0:
-                        optimizer.zero_grad()
-                        accelerator.backward(d_loss_slm)
-                        optimizer.step('wd')
-
-            iters = iters + 1
+            iters += 1
 
             log_interval = config['log_interval']
-            if (i+1)%log_interval == 0:
+            if (batch_idx+1)%log_interval == 0:
                 # Log metrics to wandb
                 wandb.log({
                     'train/mel_loss': running_mel_loss / log_interval,
@@ -764,9 +765,7 @@ def main(config_path):
                 
                 running_mel_loss = 0
             
-        loss_test = 0
-        loss_align = 0
-        loss_f = 0
+        loss_test = 0; loss_align = 0; loss_f = 0
         _ = [model[key].eval() for key in model]
 
         with torch.no_grad():
@@ -774,59 +773,44 @@ def main(config_path):
             for _, batch in enumerate(val_dataloader):
                 optimizer.zero_grad()
 
-                try:
-                    waves = batch[0]
-                    batch = [b.to(device) for b in batch[1:]]
-                    texts, text_input_lengths, ood_texts, ood_text_lengths, mels, mel_input_lengths, ref_mels = batch
-                    
-                    mel_mask, text_mask = create_masks(mel_input_lengths, text_input_lengths, n_down, device)
+                _ = [b.to(device) for i, b in enumerate(batch) if i > 0]
+                waves, texts, text_input_lengths, ood_texts, ood_text_lengths, mels, mel_input_lengths, ref_mels = batch
+                
+                mel_mask, text_mask = create_masks(mel_input_lengths, text_input_lengths, n_down, device)
 
-                    _, _, s2s_soft_attn = model.text_aligner(mels, mel_mask, texts)
-                    s2s_soft_attn = process_attention_matrix(s2s_soft_attn)
+                _, _, s2s_soft_attn = model.text_aligner(mels, mel_mask, texts)
+                s2s_soft_attn = process_attention_matrix(s2s_soft_attn)
 
-                    aligned_text, s2s_mono_attn, duration_ground_truth = align_text_to_speech(model, texts, text_input_lengths, mel_input_lengths, s2s_soft_attn, text_mask, n_down)
+                aligned_text, s2s_mono_attn, duration_ground_truth = align_text_to_speech(model, texts, text_input_lengths, mel_input_lengths, s2s_soft_attn, text_mask, n_down)
 
-                    # Compute global styles
-                    prosodic_styles, target_styles = compute_global_styles(model, mels, mel_input_lengths)
+                # Compute global styles
+                prosodic_styles, target_styles = compute_global_styles(model, mels, mel_input_lengths)
 
-                    _, bert_output_encoded = encode_text_with_bert(model, texts, text_mask)
-                    # Using s2s_mono_attn has already seen the mel which is is suspicious
-                    duration_pred, feature_pred = model.predictor(bert_output_encoded, prosodic_styles, text_input_lengths, s2s_mono_attn, text_mask) 
+                _, bert_output_encoded = encode_text_with_bert(model, texts, text_mask)
+                # Using s2s_mono_attn has already seen the mel which is is suspicious
+                duration_pred, feature_pred = model.predictor(bert_output_encoded, prosodic_styles, text_input_lengths, s2s_mono_attn, text_mask) 
 
-                    aligned_text_segments, predicted_feature_segments, ground_truth_mel_segments, ground_truth_waveform_segments = extract_training_segments(mel_input_lengths, aligned_text, feature_pred, mels, waves, device, config['max_len'])
-                    prosodic_segment_style = model.predictor_encoder(ground_truth_mel_segments.unsqueeze(1))
+                aligned_text_segments, predicted_feature_segments, ground_truth_mel_segments, ground_truth_waveform_segments = extract_training_segments(mel_input_lengths, aligned_text, feature_pred, mels, waves, device, config['max_len'])
+                prosodic_segment_style = model.predictor_encoder(ground_truth_mel_segments.unsqueeze(1))
 
-                    F0_fake, N_fake = model.predictor.F0Ntrain(predicted_feature_segments, prosodic_segment_style)
+                F0_fake, N_fake = model.predictor.F0Ntrain(predicted_feature_segments, prosodic_segment_style)
 
-                    loss_dur = 0
-                    for _s2s_pred, _text_input, _text_length in zip(duration_pred, (duration_ground_truth), text_input_lengths):
-                        _s2s_pred = _s2s_pred[:_text_length, :]
-                        _text_input = _text_input[:_text_length].long()
-                        _s2s_trg = torch.zeros_like(_s2s_pred)
-                        for bib in range(_s2s_trg.shape[0]):
-                            _s2s_trg[bib, :_text_input[bib]] = 1
-                        _dur_pred = torch.sigmoid(_s2s_pred).sum(axis=1)
-                        loss_dur += F.l1_loss(_dur_pred[1:_text_length-1], 
-                                               _text_input[1:_text_length-1])
+                _ , loss_dur = compute_duration_losses(duration_pred, duration_ground_truth, text_input_lengths)
 
-                    loss_dur /= texts.size(0)
+                acoustic_segment_style = model.style_encoder(ground_truth_mel_segments.unsqueeze(1))
 
-                    acoustic_segment_style = model.style_encoder(ground_truth_mel_segments.unsqueeze(1))
+                reconstructed_waveform_all_the_way = model.decoder(aligned_text_segments, F0_fake, N_fake, acoustic_segment_style)
+                loss_mel = stft_loss(reconstructed_waveform_all_the_way.squeeze(), ground_truth_waveform_segments.detach())
 
-                    y_rec = model.decoder(aligned_text_segments, F0_fake, N_fake, acoustic_segment_style)
-                    loss_mel = stft_loss(y_rec.squeeze(), ground_truth_waveform_segments.detach())
+                F0_real, _, F0 = model.pitch_extractor(ground_truth_mel_segments.unsqueeze(1)) 
 
-                    F0_real, _, F0 = model.pitch_extractor(ground_truth_mel_segments.unsqueeze(1)) 
+                loss_F0 = F.l1_loss(F0_real, F0_fake) / 10
 
-                    loss_F0 = F.l1_loss(F0_real, F0_fake) / 10
+                loss_test += (loss_mel).mean()
+                loss_align += (loss_dur).mean()
+                loss_f += (loss_F0).mean()
 
-                    loss_test += (loss_mel).mean()
-                    loss_align += (loss_dur).mean()
-                    loss_f += (loss_F0).mean()
-
-                    iters_test += 1
-                except:
-                    continue
+                iters_test += 1
 
         # Log metrics to wandb instead of tensorboard
         wandb.log({
