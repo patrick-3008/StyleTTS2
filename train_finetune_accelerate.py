@@ -283,6 +283,121 @@ def align_text_to_speech(model, texts, input_lengths, mel_input_length, s2s_attn
     
     return aligned_text_features, monotonic_attention, duration_gt
 
+def compute_global_styles(model, mels, mel_input_length):
+    """
+    Compute global acoustic and prosodic styles for each mel spectrogram in the batch.
+    
+    This operation cannot be done in batch because of the avgpool layer.
+    
+    Args:
+        model: The model containing style_encoder and predictor_encoder
+        mels: Batch of mel spectrograms
+        mel_input_length: Lengths of mel spectrograms
+        
+    Returns:
+        tuple: (s_dur, gs, s_trg) - prosodic styles, acoustic styles, and combined target styles
+    """
+    prosodic_styles = []
+    acoustic_styles = []
+    
+    for i in range(len(mel_input_length)):
+        mel = mels[i, :, :mel_input_length[i]]
+        
+        # Extract prosodic style
+        prosodic_style = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
+        prosodic_styles.append(prosodic_style)
+        
+        # Extract acoustic style
+        acoustic_style = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
+        acoustic_styles.append(acoustic_style)
+
+    # Stack and squeeze properly to maintain batch dimension
+    prosodic_styles = torch.stack(prosodic_styles)
+    prosodic_styles = prosodic_styles.squeeze(tuple(range(1, len(prosodic_styles.shape))))  # global prosodic styles
+    
+    acoustic_styles = torch.stack(acoustic_styles)
+    acoustic_styles = acoustic_styles.squeeze(tuple(range(1, len(acoustic_styles.shape))))  # global acoustic styles
+    
+    # Combine styles for denoiser ground truth
+    target_styles = torch.cat([acoustic_styles, prosodic_styles], dim=-1).detach()
+    
+    return prosodic_styles, target_styles
+
+def encode_text_with_bert(model, texts, text_mask):
+    """
+    Encode text inputs using BERT and the BERT encoder.
+    
+    Args:
+        model: The model containing bert and bert_encoder components
+        texts: Input text tokens
+        text_mask: Mask for text inputs
+        
+    Returns:
+        Encoded BERT output with transposed dimensions for further processing
+    """
+    bert_output = model.bert(texts, attention_mask=(~text_mask).int())
+    bert_output_encoded = model.bert_encoder(bert_output).transpose(-1, -2)
+    return bert_output, bert_output_encoded
+
+def extract_training_segments(mel_input_length, aligned_text, p, mels, waves, device, max_len):
+    """
+    Extract random segments from mel spectrograms and audio waveforms for training.
+    
+    Args:
+        mel_input_length: Lengths of mel spectrograms in the batch
+        aligned_text: Text features aligned with speech
+        p: Predicted features from the predictor
+        mels: Mel spectrograms
+        waves: Audio waveforms
+        device: Device to place tensors on
+        max_len: Maximum length constraint for segments
+        
+    Returns:
+        tuple: (
+            aligned_text_segments,
+            predicted_feature_segments,
+            ground_truth_mel_segments,
+            waveform_segments,
+        )
+    """
+    # Calculate segment lengths
+    content_segment_length = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
+    
+    # Initialize empty lists for collecting segments
+    aligned_text_segments = []
+    ground_truth_mel_segments = []
+    predicted_feature_segments = []
+    ground_truth_waveform_segments = []
+    
+    # Extract segments for each sample in the batch
+    for batch_idx in range(len(mel_input_length)):
+        mel_length = int(mel_input_length[batch_idx].item() / 2)
+
+        # Select random starting point for content segments
+        content_random_start = np.random.randint(0, mel_length - content_segment_length)
+        
+        # Extract content segments
+        aligned_text_segments.append(aligned_text[batch_idx, :, content_random_start:content_random_start+content_segment_length])
+        predicted_feature_segments.append(p[batch_idx, :, content_random_start:content_random_start+content_segment_length])
+        ground_truth_mel_segments.append(mels[batch_idx, :, (content_random_start * 2):((content_random_start+content_segment_length) * 2)])
+        
+        # Extract corresponding audio segment (300 is the ratio of audio samples to mel frames)
+        audio_segment = waves[batch_idx][(content_random_start * 2) * 300:((content_random_start+content_segment_length) * 2) * 300]
+        ground_truth_waveform_segments.append(torch.from_numpy(audio_segment).to(device))
+        
+    # Stack segments into tensors
+    ground_truth_waveform_segments = torch.stack(ground_truth_waveform_segments).float().detach()
+    aligned_text_segments = torch.stack(aligned_text_segments)
+    predicted_feature_segments = torch.stack(predicted_feature_segments)
+    ground_truth_mel_segments = torch.stack(ground_truth_mel_segments).detach()
+    
+    return (
+        aligned_text_segments,
+        predicted_feature_segments,
+        ground_truth_mel_segments,
+        ground_truth_waveform_segments
+        )
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -369,37 +484,14 @@ def main(config_path):
 
             aligned_text, s2s_attn_mono, d_gt = align_text_to_speech(model, texts, input_lengths, mel_input_length, s2s_attn, text_mask, n_down)
 
-            # compute the style of the entire utterance
-            # this operation cannot be done in batch because of the avgpool layer (may need to work on masked avgpool)
-            ss = []
-            gs = []
-            for bib in range(len(mel_input_length)):
-                mel_length = int(mel_input_length[bib].item())
-                mel = mels[bib, :, :mel_input_length[bib]]
-                s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
-                ss.append(s)
-                s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
-                gs.append(s)
+            # Compute global styles
+            prosodic_styles, target_styles = compute_global_styles(model, mels, mel_input_length)
 
-            # Fix: Use squeeze(1) instead of squeeze() to avoid removing batch dimension
-            s_dur = torch.stack(ss); s_dur = s_dur.squeeze(tuple(range(1, len(s_dur.shape))))  # global prosodic styles
-            gs = torch.stack(gs); gs = gs.squeeze(tuple(range(1, len(gs.shape)))) # global acoustic styles
-            s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
-
-            bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
-            d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
+            bert_output, bert_output_encoded = encode_text_with_bert(model, texts, text_mask)
             
             # denoiser training
             if epoch >= diffusion_training_epoch:
-                loss_diff, loss_sty, sigma_data = train_diffusion(
-                    model, 
-                    model_params, 
-                    sampler, 
-                    s_trg, 
-                    bert_dur, 
-                    ref_mels if multispeaker else None,
-                    device
-                )
+                loss_diff, loss_sty, sigma_data = train_diffusion(model, model_params, sampler, target_styles, bert_output, ref_mels if multispeaker else None, device)
                 
                 if sigma_data is not None:
                     running_std.append(sigma_data)
@@ -407,66 +499,34 @@ def main(config_path):
                 loss_sty = 0
                 loss_diff = 0
 
+            d, p = model.predictor(bert_output_encoded, prosodic_styles, input_lengths, s2s_attn_mono, text_mask)
                 
-            d, p = model.predictor(d_en, s_dur, input_lengths, s2s_attn_mono, text_mask)
-                
-            mel_len_st = int(mel_input_length.min().item() / 2 - 1)
-            mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
-            en = []
-            gt = []
-            p_en = []
-            wav = []
-            st = []
-            
-            for bib in range(len(mel_input_length)):
-                mel_length = int(mel_input_length[bib].item() / 2)
+            aligned_text_segments, predicted_feature_segments, ground_truth_mel_segments, ground_truth_waveform_segments = extract_training_segments(mel_input_length, aligned_text, p, mels, waves, device, max_len)
 
-                random_start = np.random.randint(0, mel_length - mel_len)
-                en.append(aligned_text[bib, :, random_start:random_start+mel_len])
-                p_en.append(p[bib, :, random_start:random_start+mel_len])
-                gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
-                
-                y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
-                wav.append(torch.from_numpy(y).to(device))
-                
-                # style reference (better to be different from the GT)
-                random_start = np.random.randint(0, mel_length - mel_len_st)
-                st.append(mels[bib, :, (random_start * 2):((random_start+mel_len_st) * 2)])
-                
-            wav = torch.stack(wav).float().detach()
-
-            en = torch.stack(en)
-            p_en = torch.stack(p_en)
-            gt = torch.stack(gt).detach()
-            st = torch.stack(st).detach()
-            
-            
-            if gt.size(-1) < 80:
+            if ground_truth_mel_segments.size(-1) < 80:
                 continue
             
-            s = model.style_encoder(gt.unsqueeze(1))           
-            s_dur = model.predictor_encoder(gt.unsqueeze(1))
+            acoustic_segment_style = model.style_encoder(ground_truth_mel_segments.unsqueeze(1))           
+            prosodic_segment_style = model.predictor_encoder(ground_truth_mel_segments.unsqueeze(1))
                 
             with torch.no_grad():
-                F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
+                F0_real, _, F0 = model.pitch_extractor(ground_truth_mel_segments.unsqueeze(1))
                 F0 = F0.reshape(F0.shape[0], F0.shape[1] * 2, F0.shape[2], 1).squeeze()
 
-                N_real = log_norm(gt.unsqueeze(1)).squeeze(1)
+                N_real = log_norm(ground_truth_mel_segments.unsqueeze(1)).squeeze(1)
                 
-                y_rec_gt = wav.unsqueeze(1)
-                y_rec_gt_pred = model.decoder(en, F0_real, N_real, s)
+                ground_truth_waveform_segments = ground_truth_waveform_segments.unsqueeze(1)
+                reconstructed_waveform_segments = model.decoder(aligned_text_segments, F0_real, N_real, acoustic_segment_style)
 
-                wav = y_rec_gt
+            F0_fake, N_fake = model.predictor.F0Ntrain(predicted_feature_segments, prosodic_segment_style)
 
-            F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
-
-            y_rec = model.decoder(en, F0_fake, N_fake, s)
+            reconstructed_waveform_all_the_way = model.decoder(aligned_text_segments, F0_fake, N_fake, acoustic_segment_style)
 
             loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
             loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
 
             optimizer.zero_grad()
-            d_loss = discriminator_loss(wav.detach(), y_rec.detach()).mean()
+            d_loss = discriminator_loss(ground_truth_waveform_segments, reconstructed_waveform_segments.detach()).mean()
             accelerator.backward(d_loss)
             optimizer.step('msd')
             optimizer.step('mpd')
@@ -474,9 +534,12 @@ def main(config_path):
             # generator loss
             optimizer.zero_grad()
 
-            loss_mel = stft_loss(y_rec, wav)
-            loss_gen_all = generator_loss(wav, y_rec).mean()
-            loss_lm = wavlm_loss(wav.detach().squeeze(tuple(range(1, len(wav.shape)))), y_rec.squeeze(tuple(range(1, len(y_rec.shape))))).mean()
+            loss_mel = stft_loss(reconstructed_waveform_all_the_way, ground_truth_waveform_segments)
+            loss_gen_all = generator_loss(ground_truth_waveform_segments, reconstructed_waveform_all_the_way).mean()
+            loss_lm = wavlm_loss(
+                ground_truth_waveform_segments.detach().squeeze(tuple(range(1, len(ground_truth_waveform_segments.shape)))), 
+                reconstructed_waveform_all_the_way.squeeze(tuple(range(1, len(reconstructed_waveform_all_the_way.shape))))
+            ).mean()
 
             loss_ce = 0
             loss_dur = 0
@@ -543,15 +606,15 @@ def main(config_path):
                     ref_texts = texts
                     
                 slm_out = slmadv(i, 
-                                 y_rec_gt, 
-                                 y_rec_gt_pred, 
+                                 ground_truth_waveform_segments, 
+                                 reconstructed_waveform_segments, 
                                  waves, 
                                  mel_input_length,
                                  ref_texts, 
-                                 ref_lengths, use_ind, s_trg.detach(), compute_reference_styles(model, ref_mels) if multispeaker else None)
+                                 ref_lengths, use_ind, target_styles, compute_reference_styles(model, ref_mels) if multispeaker else None)
 
                 if slm_out is not None:
-                    d_loss_slm, loss_gen_lm, y_pred = slm_out
+                    d_loss_slm, loss_gen_lm, _ = slm_out
 
                     # SLM generator loss
                     optimizer.zero_grad()
@@ -640,25 +703,11 @@ def main(config_path):
 
                     aligned_text, s2s_attn_mono, d_gt = align_text_to_speech(model, texts, input_lengths, mel_input_length, s2s_attn, text_mask, n_down)
 
-                    ss = []
-                    gs = []
+                    # Compute global styles
+                    prosodic_styles, target_styles = compute_global_styles(model, mels, mel_input_length)
 
-                    for bib in range(len(mel_input_length)):
-                        mel_length = int(mel_input_length[bib].item())
-                        mel = mels[bib, :, :mel_input_length[bib]]
-                        s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
-                        ss.append(s)
-                        s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
-                        gs.append(s)
-
-                    # Fix: Use squeeze(1) instead of squeeze() to avoid removing batch dimension
-                    s = torch.stack(ss); s = s.squeeze(tuple(range(1, len(s.shape))))
-                    gs = torch.stack(gs); gs = gs.squeeze(tuple(range(1, len(gs.shape))))
-                    s_trg = torch.cat([s, gs], dim=-1).detach()
-
-                    bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
-                    d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
-                    d, p = model.predictor(d_en, s, input_lengths, s2s_attn_mono, text_mask)
+                    _, bert_output_encoded = encode_text_with_bert(model, texts, text_mask)
+                    d, p = model.predictor(bert_output_encoded, s, input_lengths, s2s_attn_mono, text_mask)
                     # get clips
                     mel_len = int(mel_input_length.min().item() / 2 - 1)
                     en = []
