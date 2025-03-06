@@ -520,7 +520,6 @@ def main(config_path):
 
             F0_fake, N_fake = model.predictor.F0Ntrain(predicted_feature_segments, prosodic_segment_style)
 
-            reconstructed_waveform_all_the_way = model.decoder(aligned_text_segments, F0_fake, N_fake, acoustic_segment_style)
 
             loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
             loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
@@ -534,10 +533,11 @@ def main(config_path):
             # generator loss
             optimizer.zero_grad()
 
+            reconstructed_waveform_all_the_way = model.decoder(aligned_text_segments, F0_fake, N_fake, acoustic_segment_style)
             loss_mel = stft_loss(reconstructed_waveform_all_the_way, ground_truth_waveform_segments)
             loss_gen_all = generator_loss(ground_truth_waveform_segments, reconstructed_waveform_all_the_way).mean()
             loss_lm = wavlm_loss(
-                ground_truth_waveform_segments.detach().squeeze(tuple(range(1, len(ground_truth_waveform_segments.shape)))), 
+                ground_truth_waveform_segments.squeeze(tuple(range(1, len(ground_truth_waveform_segments.shape)))), 
                 reconstructed_waveform_all_the_way.squeeze(tuple(range(1, len(reconstructed_waveform_all_the_way.shape))))
             ).mean()
 
