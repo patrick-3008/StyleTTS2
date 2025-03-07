@@ -17,29 +17,7 @@ logger.setLevel(logging.DEBUG)
 
 import pandas as pd
 
-_pad = "$"
-_punctuation = ';:,.!?¡¿—…"«»“” '
-_letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-_letters_ipa = "ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ"
-
-# Export all symbols:
-symbols = [_pad] + list(_punctuation) + list(_letters) + list(_letters_ipa)
-
-dicts = {}
-for i in range(len((symbols))):
-    dicts[symbols[i]] = i
-
-class TextCleaner:
-    def __init__(self, dummy=None):
-        self.word_index_dictionary = dicts
-    def __call__(self, text):
-        indexes = []
-        for char in text:
-            try:
-                indexes.append(self.word_index_dictionary[char])
-            except KeyError:
-                print(text)
-        return indexes
+from char_indexer import VanillaCharacterIndexer, BertCharacterIndexer
 
 np.random.seed(1)
 random.seed(1)
@@ -67,7 +45,8 @@ class FilePathDataset(torch.utils.data.Dataset):
 
         _data_list = [l.strip().split('|') for l in data_list]
         self.data_list = [data if len(data) == 3 else (*data, 0) for data in _data_list]
-        self.text_cleaner = TextCleaner()
+        self.char_indexer = VanillaCharacterIndexer()
+        self.bert_char_indexer = BertCharacterIndexer()
         self.sr = sr
 
         self.df = pd.DataFrame(self.data_list)
@@ -92,7 +71,7 @@ class FilePathDataset(torch.utils.data.Dataset):
         path = data[0]
         
         # Load original sample
-        wave, text_tensor, speaker_id = self._load_tensor(data)
+        wave, text_tensor, bert_text_tensor, speaker_id = self._load_tensor(data)
         
         # Process original audio into mel spectrogram
         mel_tensor = preprocess(wave).squeeze()
@@ -111,13 +90,13 @@ class FilePathDataset(torch.utils.data.Dataset):
             rand_idx = np.random.randint(0, len(self.ptexts) - 1)
             ood_text = self.ptexts[rand_idx]
             
-            ood_text_indices = self.text_cleaner(ood_text)
+            ood_text_indices = self.char_indexer(ood_text)
             ood_text_indices.insert(0, 0)  # Add start token
             ood_text_indices.append(0)     # Add end token
 
             ood_text_tensor = torch.LongTensor(ood_text_indices)
         
-        return speaker_id, acoustic_feature, text_tensor, ood_text_tensor, ref_mel_tensor, ref_label, path, wave
+        return speaker_id, acoustic_feature, text_tensor, bert_text_tensor, ood_text_tensor, ref_mel_tensor, ref_label, path, wave
 
     def _load_tensor(self, data):
         wave_path, text, speaker_id = data
@@ -130,17 +109,19 @@ class FilePathDataset(torch.utils.data.Dataset):
             
         wave = np.concatenate([np.zeros([5000]), wave, np.zeros([5000])], axis=0)
         
-        text = self.text_cleaner(text)
+        text = self.char_indexer(text)
+        bert_text = self.bert_char_indexer(text)
         
-        text.insert(0, 0)
-        text.append(0)
+        text.insert(0, 0); bert_text.insert(0, 0)
+        text.append(0); bert_text.append(0)
         
         text = torch.LongTensor(text)
+        bert_text = torch.LongTensor(bert_text)
 
-        return wave, text, speaker_id
+        return wave, text, bert_text, speaker_id
 
     def _load_data(self, data):
-        wave, _, speaker_id = self._load_tensor(data)
+        wave, _, _, speaker_id = self._load_tensor(data)
         mel_tensor = preprocess(wave).squeeze()
 
         mel_length = mel_tensor.size(1)
@@ -174,11 +155,12 @@ class Collater(object):
         nmels = batch[0][1].size(0)
         max_mel_length = max([b[1].shape[1] for b in batch])
         max_text_length = max([b[2].shape[0] for b in batch])
-        max_rtext_length = max([b[3].shape[0] for b in batch])
+        max_rtext_length = max([b[4].shape[0] for b in batch])
 
         labels = torch.zeros((batch_size)).long()
         mels = torch.zeros((batch_size, nmels, max_mel_length)).float()
         texts = torch.zeros((batch_size, max_text_length)).long()
+        bert_texts = torch.zeros((batch_size, max_text_length)).long()
         ref_texts = torch.zeros((batch_size, max_rtext_length)).long()
 
         input_lengths = torch.zeros(batch_size).long()
@@ -189,13 +171,14 @@ class Collater(object):
         paths = ['' for _ in range(batch_size)]
         waves = [None for _ in range(batch_size)]
         
-        for bid, (label, mel, text, ref_text, ref_mel, ref_label, path, wave) in enumerate(batch):
+        for bid, (label, mel, text, bert_text, ref_text, ref_mel, ref_label, path, wave) in enumerate(batch):
             mel_size = mel.size(1)
             text_size = text.size(0)
             rtext_size = ref_text.size(0)
             labels[bid] = label
             mels[bid, :, :mel_size] = mel
             texts[bid, :text_size] = text
+            bert_texts[bid, :text_size] = bert_text
             ref_texts[bid, :rtext_size] = ref_text
             input_lengths[bid] = text_size
             ref_lengths[bid] = rtext_size
@@ -207,8 +190,7 @@ class Collater(object):
             ref_labels[bid] = ref_label
             waves[bid] = wave
 
-        return waves, texts, input_lengths, ref_texts, ref_lengths, mels, output_lengths, ref_mels
-
+        return waves, texts, bert_texts, input_lengths, ref_texts, ref_lengths, mels, output_lengths, ref_mels
 
 
 def build_dataloader(path_list,
@@ -220,7 +202,7 @@ def build_dataloader(path_list,
                      num_workers=1,
                      device='cpu',
                      collate_config={},
-                     dataset_config={}, **kwargs):
+                     dataset_config={}):
     
     dataset = FilePathDataset(path_list, root_path, OOD_data=OOD_data, min_length=min_length, validation=validation, **dataset_config)
     collate_fn = Collater(**collate_config)
