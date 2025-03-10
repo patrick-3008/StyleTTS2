@@ -84,7 +84,6 @@ def main(config_path):
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
     logger.addHandler(file_handler)
-
     
     batch_size = config['batch_size']
 
@@ -111,24 +110,8 @@ def main(config_path):
     train_list, val_list = get_data_path_list(train_path, val_path)
     device = accelerator.device
 
-    train_dataloader = build_dataloader(train_list,
-                                        root_path,
-                                        OOD_data=OOD_data,
-                                        min_length=min_length,
-                                        batch_size=batch_size,
-                                        num_workers=2,
-                                        dataset_config={},
-                                        device=device)
-
-    val_dataloader = build_dataloader(val_list,
-                                      root_path,
-                                      OOD_data=OOD_data,
-                                      min_length=min_length,
-                                      batch_size=batch_size,
-                                      validation=True,
-                                      num_workers=0,
-                                      device=device,
-                                      dataset_config={})
+    train_dataloader = build_dataloader(train_list, batch_size=batch_size, num_workers=2, device=device, **data_params)
+    val_dataloader = build_dataloader(val_list, validation=True, batch_size=batch_size, num_workers=0, device=device, **data_params)
     
     # Load pretrained models
     text_aligner, pitch_extractor, plbert = load_pretrained_models(config, device)
