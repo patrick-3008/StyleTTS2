@@ -123,6 +123,70 @@ def setup_optimizers(model, optimizer_params, epochs, train_dataloader_length):
     
     return optimizer
 
+def perform_text_alignment(model, mels, mask, texts):
+    """
+    Perform text alignment using the text aligner model.
+    
+    Args:
+        model: Model containing the text_aligner component
+        mels: Mel spectrograms
+        mask: Mask for the mel spectrograms
+        texts: Text inputs
+        
+    Returns:
+        tuple: (s2s_pred, s2s_attn) - speech-to-speech predictions and attention
+        
+    Raises:
+        Exception: If text alignment fails
+    """
+    _, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
+    s2s_attn = s2s_attn.transpose(-1, -2)
+    s2s_attn = s2s_attn[..., 1:]
+    s2s_attn = s2s_attn.transpose(-1, -2)
+    
+    return s2s_pred, s2s_attn
+
+def calculate_duration_and_ce_losses(duration_predictions, duration_targets, input_lengths):
+    """
+    Calculate duration and cross-entropy losses for text-to-speech alignment.
+    
+    Args:
+        duration_predictions: Predicted durations from the model
+        duration_targets: Ground truth duration targets
+        input_lengths: Lengths of the input sequences
+        
+    Returns:
+        tuple: (loss_ce, loss_dur) - Cross-entropy loss and duration loss
+    """
+    loss_ce = 0
+    loss_dur = 0
+    batch_size = len(duration_predictions)
+    
+    for pred, target, length in zip(duration_predictions, duration_targets, input_lengths):
+        # Trim predictions to actual sequence length
+        pred = pred[:length, :]
+        target = target[:length].long()
+        
+        # Create binary target matrix
+        binary_target = torch.zeros_like(pred)
+        for i in range(binary_target.shape[0]):
+            binary_target[i, :target[i]] = 1
+        
+        # Calculate duration prediction by applying sigmoid and summing
+        dur_pred = torch.sigmoid(pred).sum(axis=1)
+        
+        # Skip first and last tokens for duration loss (typically BOS/EOS tokens)
+        loss_dur += F.l1_loss(dur_pred[1:length-1], target[1:length-1])
+        
+        # Calculate cross-entropy loss on flattened predictions and targets
+        loss_ce += F.binary_cross_entropy_with_logits(pred.flatten(), binary_target.flatten())
+    
+    # Normalize losses by batch size
+    loss_ce /= batch_size
+    loss_dur /= batch_size
+    
+    return loss_ce, loss_dur
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -239,16 +303,7 @@ def main(config_path):
         running_loss = 0
 
         _ = [model[key].eval() for key in model]
-        
-        model.text_aligner.train()
-        model.text_encoder.train()
-        
-        model.predictor.train()
-        model.bert_encoder.train()
-        model.bert.train()
-        model.msd.train()
-        model.mpd.train()
-
+        _ = [model[key].train() for key in ['text_aligner', 'text_encoder', 'predictor', 'bert_encoder', 'bert', 'msd', 'mpd']]
         for i, batch in enumerate(train_dataloader):
             waves = batch[0]
             batch = [b.to(device) for b in batch[1:]]
@@ -268,10 +323,7 @@ def main(config_path):
                     ref = torch.cat([ref_ss, ref_sp], dim=1)
                 
             try:
-                _, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
-                s2s_attn = s2s_attn.transpose(-1, -2)
-                s2s_attn = s2s_attn[..., 1:]
-                s2s_attn = s2s_attn.transpose(-1, -2)
+                s2s_pred, s2s_attn = perform_text_alignment(model, mels, mask, texts)
             except:
                 continue
 
@@ -413,22 +465,7 @@ def main(config_path):
             loss_gen_all = gl(wav, y_rec).mean()
             loss_lm = wl(wav.detach().squeeze(tuple(range(1, len(wav.shape)))), y_rec.squeeze(tuple(range(1, len(y_rec.shape))))).mean()
 
-            loss_ce = 0
-            loss_dur = 0
-            for _s2s_pred, _text_input, _text_length in zip(d, (d_gt), input_lengths):
-                _s2s_pred = _s2s_pred[:_text_length, :]
-                _text_input = _text_input[:_text_length].long()
-                _s2s_trg = torch.zeros_like(_s2s_pred)
-                for p in range(_s2s_trg.shape[0]):
-                    _s2s_trg[p, :_text_input[p]] = 1
-                _dur_pred = torch.sigmoid(_s2s_pred).sum(axis=1)
-
-                loss_dur += F.l1_loss(_dur_pred[1:_text_length-1], 
-                                       _text_input[1:_text_length-1])
-                loss_ce += F.binary_cross_entropy_with_logits(_s2s_pred.flatten(), _s2s_trg.flatten())
-
-            loss_ce /= texts.size(0)
-            loss_dur /= texts.size(0)
+            loss_ce, loss_dur = calculate_duration_and_ce_losses(d, d_gt, input_lengths)
             
             loss_s2s = 0
             for _s2s_pred, _text_input, _text_length in zip(s2s_pred, texts, input_lengths):
@@ -566,7 +603,7 @@ def main(config_path):
 
         with torch.no_grad():
             iters_test = 0
-            for batch_idx, batch in enumerate(val_dataloader):
+            for _, batch in enumerate(val_dataloader):
                 optimizer.zero_grad()
 
                 try:
@@ -581,10 +618,7 @@ def main(config_path):
                         mask = length_to_mask(mel_input_length // (2 ** n_down)).to('cuda')
                         text_mask = length_to_mask(input_lengths).to(texts.device)
 
-                        _, _, s2s_attn = model.text_aligner(mels, mask, texts)
-                        s2s_attn = s2s_attn.transpose(-1, -2)
-                        s2s_attn = s2s_attn[..., 1:]
-                        s2s_attn = s2s_attn.transpose(-1, -2)
+                        s2s_pred, s2s_attn = perform_text_alignment(model, mels, mask, texts)
 
                         mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
                         s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
@@ -645,19 +679,7 @@ def main(config_path):
 
                     F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s)
 
-                    loss_dur = 0
-                    for _s2s_pred, _text_input, _text_length in zip(d, (d_gt), input_lengths):
-                        _s2s_pred = _s2s_pred[:_text_length, :]
-                        _text_input = _text_input[:_text_length].long()
-                        _s2s_trg = torch.zeros_like(_s2s_pred)
-                        for bib in range(_s2s_trg.shape[0]):
-                            _s2s_trg[bib, :_text_input[bib]] = 1
-                        _dur_pred = torch.sigmoid(_s2s_pred).sum(axis=1)
-                        loss_dur += F.l1_loss(_dur_pred[1:_text_length-1], 
-                                               _text_input[1:_text_length-1])
-
-                    loss_dur /= texts.size(0)
-
+                    _, loss_dur = calculate_duration_and_ce_losses(d, d_gt, input_lengths)
                     s = model.style_encoder(gt.unsqueeze(1))
 
                     y_rec = model.decoder(en, F0_fake, N_fake, s)
