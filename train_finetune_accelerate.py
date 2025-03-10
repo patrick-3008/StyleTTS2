@@ -1,7 +1,6 @@
 # load packages
 import random
 import yaml
-import time
 from munch import Munch
 import numpy as np
 import torch
@@ -42,6 +41,32 @@ from logging import StreamHandler
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+def load_pretrained_models(config, device):
+    """
+    Load all pretrained models required for training.
+    
+    Args:
+        config: Configuration dictionary containing model paths
+        device: Device to load the models to
+        
+    Returns:
+        tuple: (text_aligner, pitch_extractor, plbert)
+    """
+    # load pretrained ASR model
+    ASR_config = config['ASR_config']
+    ASR_path = config['ASR_path']
+    text_aligner = load_ASR_models(ASR_path, ASR_config)
+    
+    # load pretrained F0 model
+    F0_path = config['F0_path']
+    pitch_extractor = load_F0_models(F0_path)
+    
+    # load PL-BERT model
+    BERT_path = config['PLBERT_dir']
+    plbert = load_plbert(BERT_path)
+    
+    return text_aligner, pitch_extractor, plbert
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -61,21 +86,21 @@ def main(config_path):
     logger.addHandler(file_handler)
 
     
-    batch_size = config.get('batch_size', 10)
+    batch_size = config['batch_size']
 
-    epochs = config.get('epochs', 200)
-    save_freq = config.get('save_freq', 2)
-    log_interval = config.get('log_interval', 10)
+    epochs = config['epochs']
+    save_freq = config['save_freq']
+    log_interval = config['log_interval']
 
-    data_params = config.get('data_params', None)
-    sr = config['preprocess_params'].get('sr', 24000)
+    data_params = config['data_params']
+    sr = config['preprocess_params']['sr']
     train_path = data_params['train_data']
     val_path = data_params['val_data']
     root_path = data_params['root_path']
     min_length = data_params['min_length']
     OOD_data = data_params['OOD_data']
 
-    max_len = config.get('max_len', 200)
+    max_len = ['max_len']
     
     loss_params = Munch(config['loss_params'])
     diffusion_training_epoch = loss_params.diffusion_training_epoch
@@ -105,18 +130,8 @@ def main(config_path):
                                       device=device,
                                       dataset_config={})
     
-    # load pretrained ASR model
-    ASR_config = config.get('ASR_config', False)
-    ASR_path = config.get('ASR_path', False)
-    text_aligner = load_ASR_models(ASR_path, ASR_config)
-    
-    # load pretrained F0 model
-    F0_path = config.get('F0_path', False)
-    pitch_extractor = load_F0_models(F0_path)
-    
-    # load PL-BERT model
-    BERT_path = config.get('PLBERT_dir', False)
-    plbert = load_plbert(BERT_path)
+    # Load pretrained models
+    text_aligner, pitch_extractor, plbert = load_pretrained_models(config, device)
     
     # build model
     model_params = recursive_munch(config['model_params'])
