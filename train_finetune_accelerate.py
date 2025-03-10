@@ -41,7 +41,7 @@ from logging import StreamHandler
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-def load_pretrained_models(config, device):
+def load_pretrained_models(config):
     """
     Load all pretrained models required for training.
     
@@ -231,7 +231,7 @@ def main(config_path):
     val_dataloader = build_dataloader(val_list, validation=True, batch_size=batch_size, num_workers=0, device=device, **data_params)
     
     # Load pretrained models
-    text_aligner, pitch_extractor, plbert = load_pretrained_models(config, device)
+    text_aligner, pitch_extractor, plbert = load_pretrained_models(config)
     
     # build model
     model_params = recursive_munch(config['model_params'])
@@ -397,7 +397,6 @@ def main(config_path):
                                                     text_mask)
                 
             mel_len_st = int(mel_input_length.min().item() / 2 - 1)
-            import pdb; pdb.set_trace()
             mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
             en = []
             gt = []
