@@ -1,0 +1,36 @@
+preprocess_params:
+    tokenizer: "aubmindlab/bert-base-arabertv2"
+    num_shards: 10000
+    max_workers: 25
+    max_try_count: 3
+    timeout: 300
+    phonemizer_language: "ar"
+    preprocess_dir: "data/pl_bert"
+    hf_dataset_name: "wikimedia/wikipedia"
+    hf_dataset_split: "20231101.ar"
+    output_dir: "wikipedia_20231101.ar.processed"
+
+training_params:
+    output_dir: "checkpoints"
+    mixed_precision: "fp16"
+    batch_size: 16
+    save_interval: 5000
+    log_interval: 10
+    num_process: 1 # number of GPUs
+    num_steps: 1000000
+    learning_rate: 3e-5
+
+dataset_params:
+    word_separator: 87 # token idx used for word separation (W)
+    max_seq_length: 512 # max phoneme sequence length
+    word_pred_prob: 0.15 # probability to select work for prediction
+    phoneme_mask_prob: 0.8 # probability to mask phonemes
+    replace_prob: 0.1 # probablity to replace phonemes
+    
+model_params:
+    hidden_size: 768
+    num_attention_heads: 12
+    intermediate_size: 2048
+    max_position_embeddings: 512
+    num_hidden_layers: 12
+    dropout: 0.1

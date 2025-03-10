@@ -44,6 +44,8 @@ class FilePathDataset(torch.utils.data.Dataset):
                  ):
 
         _data_list = [l.strip().split('|') for l in data_list]
+        if validation: _data_list = random.sample(_data_list, min(100, len(_data_list)))
+
         self.data_list = [data if len(data) == 3 else (*data, 0) for data in _data_list]
         self.char_indexer = VanillaCharacterIndexer()
         self.bert_char_indexer = BertCharacterIndexer()
