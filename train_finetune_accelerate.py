@@ -187,6 +187,67 @@ def calculate_duration_and_ce_losses(duration_predictions, duration_targets, inp
     
     return loss_ce, loss_dur
 
+def create_random_segments(mel_input_length, asr, p, mels, waves, device, max_len=None):
+    """
+    Create random segments from the input data for training.
+    
+    Args:
+        mel_input_length: Tensor containing the lengths of mel spectrograms
+        asr: Tensor containing ASR features
+        p: Tensor containing predictor outputs
+        mels: Tensor containing mel spectrograms
+        waves: List of audio waveforms
+        device: Device to place tensors on
+        max_len: Optional maximum length constraint
+        
+    Returns:
+        tuple: (encoder_features, predictor_features, mel_targets, waveforms, style_references)
+            - encoder_features: Encoder features segments
+            - predictor_features: Predictor features segments
+            - mel_targets: Ground truth mel segments
+            - waveforms: Audio waveform segments
+            - style_references: Style reference segments
+    """
+    # Calculate segment lengths
+    mel_len_content = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2 if max_len else float('inf'))
+    
+    # Initialize lists for collecting segments
+    encoder_features = []
+    predictor_features = []
+    mel_targets = []
+    waveforms = []
+    
+    # Process each item in the batch
+    for batch_idx in range(len(mel_input_length)):
+        mel_length = int(mel_input_length[batch_idx].item() / 2)
+        
+        # Create content segments with consistent random start point
+        content_start = np.random.randint(0, mel_length - mel_len_content)
+        
+        # Extract encoder features
+        encoder_features.append(asr[batch_idx, :, content_start:content_start+mel_len_content])
+        
+        # Extract predictor features
+        predictor_features.append(p[batch_idx, :, content_start:content_start+mel_len_content])
+        
+        # Extract ground truth mel segments (at 2x resolution)
+        mel_targets.append(mels[batch_idx, :, (content_start * 2):((content_start+mel_len_content) * 2)])
+        
+        # Extract corresponding audio waveform segments
+        # Note: 300 is the hop length ratio between audio and mel
+        audio_start = (content_start * 2) * 300
+        audio_end = ((content_start+mel_len_content) * 2) * 300
+        waveform = waves[batch_idx][audio_start:audio_end]
+        waveforms.append(torch.from_numpy(waveform).to(device))
+        
+    # Stack all segments into tensors
+    return (
+        torch.stack(encoder_features),
+        torch.stack(predictor_features),
+        torch.stack(mel_targets).detach(),
+        torch.stack(waveforms).float().detach(),
+    )
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -396,36 +457,16 @@ def main(config_path):
                                                     s2s_attn_mono, 
                                                     text_mask)
                 
-            mel_len_st = int(mel_input_length.min().item() / 2 - 1)
-            mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
-            en = []
-            gt = []
-            p_en = []
-            wav = []
-            st = []
-            
-            for bib in range(len(mel_input_length)):
-                mel_length = int(mel_input_length[bib].item() / 2)
-
-                random_start = np.random.randint(0, mel_length - mel_len)
-                en.append(asr[bib, :, random_start:random_start+mel_len])
-                p_en.append(p[bib, :, random_start:random_start+mel_len])
-                gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
-                
-                y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
-                wav.append(torch.from_numpy(y).to(device))
-                
-                # style reference (better to be different from the GT)
-                random_start = np.random.randint(0, mel_length - mel_len_st)
-                st.append(mels[bib, :, (random_start * 2):((random_start+mel_len_st) * 2)])
-                
-            wav = torch.stack(wav).float().detach()
-
-            en = torch.stack(en)
-            p_en = torch.stack(p_en)
-            gt = torch.stack(gt).detach()
-            st = torch.stack(st).detach()
-            
+            # Create random segments for training
+            en, p_en, gt, wav = create_random_segments(
+                mel_input_length=mel_input_length,
+                asr=asr,
+                p=p,
+                mels=mels,
+                waves=waves,
+                device=device,
+                max_len=max_len
+            )
             
             if gt.size(-1) < 80:
                 continue
@@ -650,30 +691,20 @@ def main(config_path):
                                                         input_lengths, 
                                                         s2s_attn_mono, 
                                                         text_mask)
-                    # get clips
-                    mel_len = int(mel_input_length.min().item() / 2 - 1)
-                    en = []
-                    gt = []
-
-                    p_en = []
-                    wav = []
-
-                    for bib in range(len(mel_input_length)):
-                        mel_length = int(mel_input_length[bib].item() / 2)
-
-                        random_start = np.random.randint(0, mel_length - mel_len)
-                        en.append(asr[bib, :, random_start:random_start+mel_len])
-                        p_en.append(p[bib, :, random_start:random_start+mel_len])
-
-                        gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
-                        y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
-                        wav.append(torch.from_numpy(y).to(device))
-
-                    wav = torch.stack(wav).float().detach()
-
-                    en = torch.stack(en)
-                    p_en = torch.stack(p_en)
-                    gt = torch.stack(gt).detach()
+                    # Create random segments for training
+                    en, p_en, gt, wav = create_random_segments(
+                        mel_input_length=mel_input_length,
+                        asr=asr,
+                        p=p,
+                        mels=mels,
+                        waves=waves,
+                        device=device,
+                        max_len=max_len
+                    )
+                    
+                    if gt.size(-1) < 80:
+                        continue
+                    
                     s = model.predictor_encoder(gt.unsqueeze(1))
 
                     F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s)
