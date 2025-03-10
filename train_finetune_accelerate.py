@@ -185,25 +185,6 @@ def main(config_path):
 
     load_pretrained = config.get('pretrained_model', '') != '' and config.get('second_stage_load_pretrained', False)
     
-    if not load_pretrained:
-        if config.get('first_stage_path', '') != '':
-            first_stage_path = osp.join(log_dir, config.get('first_stage_path', 'first_stage.pth'))
-            print('Loading the first stage model at %s ...' % first_stage_path)
-            model, _, start_epoch, iters = load_checkpoint(model, 
-                None, 
-                first_stage_path,
-                load_only_params=True,
-                ignore_modules=['bert', 'bert_encoder', 'predictor', 'predictor_encoder', 'msd', 'mpd', 'wd', 'diffusion']) # keep starting epoch for tensorboard log
-
-            # these epochs should be counted from the start epoch
-            diffusion_training_epoch += start_epoch
-            joint_training_epoch += start_epoch
-            epochs += start_epoch
-            
-            model.predictor_encoder = copy.deepcopy(model.style_encoder)
-        else:
-            raise ValueError('You need to specify the path to the first stage model.') 
-
     gl = GeneratorLoss(model.mpd, model.msd).to(device)
     dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
     wl = WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device)
@@ -233,8 +214,7 @@ def main(config_path):
 
     n_down = model.text_aligner.n_down
 
-    best_loss = float('inf')  # best test loss
-    iters = 0
+    best_loss = float('inf'); iters = 0
     
     torch.cuda.empty_cache()
     
