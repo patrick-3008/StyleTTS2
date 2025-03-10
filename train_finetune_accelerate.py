@@ -67,6 +67,62 @@ def load_pretrained_models(config, device):
     
     return text_aligner, pitch_extractor, plbert
 
+def setup_optimizers(model, optimizer_params, epochs, train_dataloader_length):
+    """
+    Set up optimizers with appropriate learning rates and parameters for different model components.
+    
+    Args:
+        model: Dictionary containing model components
+        optimizer_params: Parameters for optimizer configuration
+        epochs: Total number of training epochs
+        train_dataloader_length: Length of the training dataloader
+        
+    Returns:
+        optimizer: Configured optimizer object
+    """
+    # Base scheduler parameters
+    base_scheduler_params = {
+        "max_lr": optimizer_params.lr,
+        "pct_start": float(0),
+        "epochs": epochs,
+        "steps_per_epoch": train_dataloader_length,
+    }
+
+    # Create scheduler params dictionary for each model component
+    scheduler_params_dict = {key: base_scheduler_params.copy() for key in model}
+    
+    # Set specific learning rates for certain components
+    scheduler_params_dict['bert']['max_lr'] = optimizer_params.bert_lr * 2
+    scheduler_params_dict['decoder']['max_lr'] = optimizer_params.ft_lr * 2
+    scheduler_params_dict['style_encoder']['max_lr'] = optimizer_params.ft_lr * 2
+    
+    # Build optimizer with model parameters and scheduler parameters
+    optimizer = build_optimizer(
+        {key: model[key].parameters() for key in model},
+        scheduler_params_dict=scheduler_params_dict, 
+        lr=optimizer_params.lr
+    )
+    
+    # Configure BERT-specific optimizer parameters
+    for param_group in optimizer.optimizers['bert'].param_groups:
+        param_group['betas'] = (0.9, 0.99)
+        param_group['lr'] = optimizer_params.bert_lr
+        param_group['initial_lr'] = optimizer_params.bert_lr
+        param_group['min_lr'] = 0
+        param_group['weight_decay'] = 0.01
+        
+    # Configure acoustic module optimizer parameters
+    acoustic_modules = ["decoder", "style_encoder"]
+    for module_name in acoustic_modules:
+        for param_group in optimizer.optimizers[module_name].param_groups:
+            param_group['betas'] = (0.0, 0.99)
+            param_group['lr'] = optimizer_params.ft_lr
+            param_group['initial_lr'] = optimizer_params.ft_lr
+            param_group['min_lr'] = 0
+            param_group['weight_decay'] = 1e-4
+    
+    return optimizer
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -77,7 +133,7 @@ def main(config_path):
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
     
     # Initialize wandb
-    wandb.init(project="style-tts2-finetune", config=config)
+    wandb.init(project="test", config=config)
 
     # write logs
     file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
@@ -95,11 +151,8 @@ def main(config_path):
     sr = config['preprocess_params']['sr']
     train_path = data_params['train_data']
     val_path = data_params['val_data']
-    root_path = data_params['root_path']
-    min_length = data_params['min_length']
-    OOD_data = data_params['OOD_data']
 
-    max_len = ['max_len']
+    max_len = config['max_len']
     
     loss_params = Munch(config['loss_params'])
     diffusion_training_epoch = loss_params.diffusion_training_epoch
@@ -153,10 +206,7 @@ def main(config_path):
 
     gl = GeneratorLoss(model.mpd, model.msd).to(device)
     dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
-    wl = WavLMLoss(model_params.slm.model, 
-                   model.wd, 
-                   sr, 
-                   model_params.slm.sr).to(device)
+    wl = WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device)
 
     gl = MyDataParallel(gl)
     dl = MyDataParallel(dl)
@@ -169,37 +219,13 @@ def main(config_path):
         clamp=False
     )
     
-    scheduler_params = {
-        "max_lr": optimizer_params.lr,
-        "pct_start": float(0),
-        "epochs": epochs,
-        "steps_per_epoch": len(train_dataloader),
-    }
-    scheduler_params_dict= {key: scheduler_params.copy() for key in model}
-    scheduler_params_dict['bert']['max_lr'] = optimizer_params.bert_lr * 2
-    scheduler_params_dict['decoder']['max_lr'] = optimizer_params.ft_lr * 2
-    scheduler_params_dict['style_encoder']['max_lr'] = optimizer_params.ft_lr * 2
+    optimizer = setup_optimizers(
+        model, 
+        optimizer_params, 
+        epochs, 
+        len(train_dataloader)
+    )
     
-    optimizer = build_optimizer({key: model[key].parameters() for key in model},
-                                          scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr)
-    
-    # adjust BERT learning rate
-    for g in optimizer.optimizers['bert'].param_groups:
-        g['betas'] = (0.9, 0.99)
-        g['lr'] = optimizer_params.bert_lr
-        g['initial_lr'] = optimizer_params.bert_lr
-        g['min_lr'] = 0
-        g['weight_decay'] = 0.01
-        
-    # adjust acoustic module learning rate
-    for module in ["decoder", "style_encoder"]:
-        for g in optimizer.optimizers[module].param_groups:
-            g['betas'] = (0.0, 0.99)
-            g['lr'] = optimizer_params.ft_lr
-            g['initial_lr'] = optimizer_params.ft_lr
-            g['min_lr'] = 0
-            g['weight_decay'] = 1e-4
-        
     # load models if there is a model
     if load_pretrained:
         model, optimizer, start_epoch, iters = load_checkpoint(model,  optimizer, config['pretrained_model'],
@@ -339,6 +365,7 @@ def main(config_path):
                                                     text_mask)
                 
             mel_len_st = int(mel_input_length.min().item() / 2 - 1)
+            import pdb; pdb.set_trace()
             mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
             en = []
             gt = []
