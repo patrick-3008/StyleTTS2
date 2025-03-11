@@ -410,7 +410,7 @@ def main(config_path):
     multispeaker = model_params.multispeaker
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
     _ = [model[key].to(device) for key in model]
-    
+
     # DP
     for key in model:
         if key != "mpd" and key != "msd" and key != "wd":
@@ -419,13 +419,13 @@ def main(config_path):
     start_epoch = 0
     iters = 0
 
-    load_pretrained = config.get('pretrained_model', '') != '' and config.get('second_stage_load_pretrained', False)
     
     generator_adv_loss = MyDataParallel(GeneratorLoss(model.mpd, model.msd).to(device))
     discriminator_adv_loss = MyDataParallel(DiscriminatorLoss(model.mpd, model.msd).to(device))
     wav_lm_loss = MyDataParallel(WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device))
 
-    
+    load_pretrained = config.get('pretrained_model', '') != '' and config.get('second_stage_load_pretrained', False)
+
     sampler = DiffusionSampler(
         model.diffusion.diffusion,
         sampler=ADPM2Sampler(),
@@ -468,15 +468,14 @@ def main(config_path):
         _ = [model[key].train() for key in ['text_aligner', 'text_encoder', 'predictor', 'bert_encoder', 'bert', 'msd', 'mpd']]
 
         for batch_idx, batch in enumerate(train_dataloader):
-            waves = batch[0]
-            batch = [b.to(device) for b in batch[1:]]
-            texts, bert_texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
+            waves, texts, bert_texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
+            _ = [b.to(device) for b in batch[1:]]
 
             if mels.size(-1) < 80:
                 continue
 
             mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
-            text_mask = length_to_mask(input_lengths).to(texts.device)
+            text_mask = length_to_mask(input_lengths).to(device)
 
             try:
                 s2s_pred, s2s_attn = perform_text_alignment(model, mels, mask, texts)
@@ -723,16 +722,15 @@ def main(config_path):
                 optimizer.zero_grad()
 
                 try:
-                    waves = batch[0]
-                    batch = [b.to(device) for b in batch[1:]]
-                    texts, bert_texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
+                    waves, texts, bert_texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
+                    _ = [b.to(device) for b in batch[1:]]
 
                     if mels.size(-1) < 80:
                         continue
 
                     with torch.no_grad():
-                        mask = length_to_mask(mel_input_length // (2 ** n_down)).to('cuda')
-                        text_mask = length_to_mask(input_lengths).to(texts.device)
+                        mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
+                        text_mask = length_to_mask(input_lengths).to(device)
 
                         s2s_pred, s2s_attn = perform_text_alignment(model, mels, mask, texts)
 
