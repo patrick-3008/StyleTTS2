@@ -527,11 +527,11 @@ def main(config_path):
                     model.diffusion.module.diffusion.sigma_data = target_style.std(axis=-1).mean().item() # batch-wise std estimation
                     running_std.append(model.diffusion.module.diffusion.sigma_data)
                     
-                loss_diff = diffusion_loss
-                loss_sty = style_recon_loss
+                loss_diff_edm = diffusion_loss
+                loss_diff_l1 = style_recon_loss
             else:
-                loss_sty = 0
-                loss_diff = 0
+                loss_diff_l1 = 0
+                loss_diff_edm = 0
 
                 
             duration_pred, predictor_features = model.predictor(bert_encoded, utterance_prosodic_style, input_lengths, alignment_attn_mono, text_mask)
@@ -588,8 +588,8 @@ def main(config_path):
                      loss_params.lambda_dur * loss_dur + \
                      loss_params.lambda_gen * loss_gen_adv + \
                      loss_params.lambda_slm * loss_gen_wavlm_adv + \
-                     loss_params.lambda_sty * loss_sty + \
-                     loss_params.lambda_diff * loss_diff + \
+                     loss_params.lambda_sty * loss_diff_l1 + \
+                     loss_params.lambda_diff * loss_diff_edm + \
                     loss_params.lambda_mono * loss_algn_mono + \
                     loss_params.lambda_s2s * loss_algn_ce
             
@@ -681,7 +681,7 @@ def main(config_path):
             
             if (batch_idx+1)%log_interval == 0:
                 logger.info ('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f, S2S Loss: %.5f, Mono Loss: %.5f'
-                    %(epoch+1, epochs, batch_idx+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_dur_ce, loss_norm, loss_F0, loss_gen_wavlm_adv, loss_gen_adv, loss_sty, loss_diff, d_loss_slm, loss_gen_lm, loss_algn_ce, loss_algn_mono))
+                    %(epoch+1, epochs, batch_idx+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_dur_ce, loss_norm, loss_F0, loss_gen_wavlm_adv, loss_gen_adv, loss_diff_l1, loss_diff_edm, d_loss_slm, loss_gen_lm, loss_algn_ce, loss_algn_mono))
                 
                 # Log metrics to wandb
                 wandb.log({
@@ -690,13 +690,13 @@ def main(config_path):
                     'train/Discriminator Adversarial Loss': d_loss,
                     'train/Duration Cross-Entropy Loss': loss_dur_ce,
                     'train/Duration Loss': loss_dur,
-                    'train/WavLM Generator Adversarial Loss': loss_gen_wavlm_adv,
+                    'train/WavLM Embedding Similarity Adversarial Loss': loss_gen_wavlm_adv,
                     'train/Energy Loss': loss_norm,
                     'train/F0 Loss': loss_F0,
-                    'train/sty_loss': loss_sty,
-                    'train/diff_loss': loss_diff,
-                    'train/d_loss_slm': d_loss_slm,
-                    'train/gen_loss_slm': loss_gen_lm,
+                    'train/Diffusion L1 Reconstruction Loss': loss_diff_l1,
+                    'train/Diffusion EDM Loss': loss_diff_edm,
+                    'train/WavLM Discriminator Adversarial Loss': d_loss_slm,
+                    'train/WavLM Generator Adversarial Loss': loss_gen_lm,
                     'train/Alignment Cross-Entropy Loss': loss_algn_ce,
                     'train/Alignment Monotonic Attention Loss': loss_algn_mono,
                     'iteration': iters
@@ -778,9 +778,9 @@ def main(config_path):
         
         # Log metrics to wandb
         wandb.log({
-            "eval/mel_loss": loss_test / iters_test,
-            "eval/dur_loss": loss_align / iters_test,
-            "eval/F0_loss": loss_f / iters_test,
+            "eval/Mel Reconstruction Loss": loss_test / iters_test,
+            "eval/Duration Loss": loss_align / iters_test,
+            "eval/F0 Loss": loss_f / iters_test,
             "epoch": epoch + 1
         })
 
