@@ -133,17 +133,17 @@ def perform_text_alignment(model, mels, mask, texts):
         texts: Text inputs
         
     Returns:
-        tuple: (s2s_pred, s2s_attn) - speech-to-speech predictions and attention
+        tuple: (alignment_logits, alignment_attn) - speech-to-speech predictions and attention
         
     Raises:
         Exception: If text alignment fails
     """
-    _, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
-    s2s_attn = s2s_attn.transpose(-1, -2)
-    s2s_attn = s2s_attn[..., 1:]
-    s2s_attn = s2s_attn.transpose(-1, -2)
+    _, alignment_logits, alignment_attn = model.text_aligner(mels, mask, texts)
+    alignment_attn = alignment_attn.transpose(-1, -2)
+    alignment_attn = alignment_attn[..., 1:]
+    alignment_attn = alignment_attn.transpose(-1, -2)
     
-    return s2s_pred, s2s_attn
+    return alignment_logits, alignment_attn
 
 def calculate_duration_and_ce_losses(duration_predictions, duration_targets, input_lengths):
     """
@@ -155,9 +155,9 @@ def calculate_duration_and_ce_losses(duration_predictions, duration_targets, inp
         input_lengths: Lengths of the input sequences
         
     Returns:
-        tuple: (loss_ce, loss_dur) - Cross-entropy loss and duration loss
+        tuple: (loss_dur_ce, loss_dur) - Cross-entropy loss and duration loss
     """
-    loss_ce = 0
+    loss_dur_ce = 0
     loss_dur = 0
     batch_size = len(duration_predictions)
     
@@ -178,13 +178,13 @@ def calculate_duration_and_ce_losses(duration_predictions, duration_targets, inp
         loss_dur += F.l1_loss(dur_pred[1:length-1], target[1:length-1])
         
         # Calculate cross-entropy loss on flattened predictions and targets
-        loss_ce += F.binary_cross_entropy_with_logits(pred.flatten(), binary_target.flatten())
+        loss_dur_ce += F.binary_cross_entropy_with_logits(pred.flatten(), binary_target.flatten())
     
     # Normalize losses by batch size
-    loss_ce /= batch_size
+    loss_dur_ce /= batch_size
     loss_dur /= batch_size
     
-    return loss_ce, loss_dur
+    return loss_dur_ce, loss_dur
 
 def create_random_segments(mel_input_length, aligned_encoded_text, predictor_features, mels, waves, device, max_len=None):
     """
@@ -416,15 +416,9 @@ def main(config_path):
         if key != "mpd" and key != "msd" and key != "wd":
             model[key] = AttributeForwardingDataParallel(model[key])
             
-    start_epoch = 0
-    iters = 0
-
-    
     generator_adv_loss = AttributeForwardingDataParallel(GeneratorLoss(model.mpd, model.msd).to(device))
     discriminator_adv_loss = AttributeForwardingDataParallel(DiscriminatorLoss(model.mpd, model.msd).to(device))
     wav_lm_loss = AttributeForwardingDataParallel(WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device))
-
-    load_pretrained = config.get('pretrained_model', '') != '' and config.get('second_stage_load_pretrained', False)
 
     sampler = DiffusionSampler(
         model.diffusion.diffusion,
@@ -441,6 +435,8 @@ def main(config_path):
     )
     
     # load models if there is a model
+    start_epoch = 0
+    load_pretrained = config.get('pretrained_model', '') != '' and config.get('second_stage_load_pretrained', False)
     if load_pretrained:
         model, optimizer, start_epoch, iters = load_checkpoint(model,  optimizer, config['pretrained_model'],
                                     load_only_params=config.get('load_only_params', True), ignore_modules=['bert'])
@@ -478,21 +474,26 @@ def main(config_path):
             text_mask = length_to_mask(input_lengths).to(device)
 
             try:
-                s2s_pred, s2s_attn = perform_text_alignment(model, mels, mask, texts)
+                alignment_logits, alignment_attn = perform_text_alignment(model, mels, mask, texts)
             except:
                 continue
 
-            mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
-            s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
-            loss_mono = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
+            loss_algn_ce = 0
+            for _alignment_logits, _text_input, _text_length in zip(alignment_logits, texts, input_lengths):
+                loss_algn_ce += F.cross_entropy(_alignment_logits[:_text_length], _text_input[:_text_length])
+            loss_algn_ce /= texts.size(0)
+            
+            mask_ST = mask_from_lens(alignment_attn, input_lengths, mel_input_length // (2 ** n_down))
+            alignment_attn_mono = maximum_path(alignment_attn, mask_ST)
+            loss_algn_mono = F.l1_loss(alignment_attn, alignment_attn_mono) * 10
 
             # encode
             text_encoded = model.text_encoder(texts, input_lengths, text_mask)
             
             # Randomly choose between regular and monotonic attention for alignment
-            attn_matrix = s2s_attn_mono if random.random() > 0.5 else s2s_attn
+            attn_matrix = alignment_attn_mono if random.random() > 0.5 else alignment_attn
             aligned_encoded_text = text_encoded @ attn_matrix
-            duration_ground_truth = s2s_attn_mono.sum(axis=-1).detach()
+            duration_ground_truth = alignment_attn_mono.sum(axis=-1).detach()
 
             # Extract style features for the entire utterance
             utterance_prosodic_style, utterance_acoustic_style = extract_style_features(model, mels, mel_input_length)
@@ -533,7 +534,8 @@ def main(config_path):
                 loss_diff = 0
 
                 
-            duration_pred, predictor_features = model.predictor(bert_encoded, utterance_prosodic_style, input_lengths, s2s_attn_mono, text_mask)
+            duration_pred, predictor_features = model.predictor(bert_encoded, utterance_prosodic_style, input_lengths, alignment_attn_mono, text_mask)
+            loss_dur_ce, loss_dur = calculate_duration_and_ce_losses(duration_pred, duration_ground_truth, input_lengths)
                 
             # Create random segments for training
             encoder_segments, predictor_segments, mel_targets_segments, waveforms_segments = create_random_segments(
@@ -561,11 +563,10 @@ def main(config_path):
                 decoder_pred_prosody_real = model.decoder(encoder_segments, F0_real, N_real, segment_acoustic_style)
 
             F0_fake, N_fake = model.predictor.F0Ntrain(predictor_segments, segment_prosodic_style)
+            loss_F0 =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
+            loss_norm = F.smooth_l1_loss(N_real, N_fake)
 
             decoder_pred_prosody_pred = model.decoder(encoder_segments, F0_fake, N_fake, segment_acoustic_style)
-
-            loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
-            loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
 
             optimizer.zero_grad()
             d_loss = discriminator_adv_loss(waveforms_segments, decoder_pred_prosody_pred.detach()).mean()
@@ -577,28 +578,20 @@ def main(config_path):
             optimizer.zero_grad()
 
             loss_mel = stft_loss(decoder_pred_prosody_pred, waveforms_segments)
-            loss_gen_all = generator_adv_loss(waveforms_segments, decoder_pred_prosody_pred).mean()
-            loss_lm = wav_lm_loss(waveforms_segments.detach().squeeze(tuple(range(1, len(waveforms_segments.shape)))), decoder_pred_prosody_pred.squeeze(tuple(range(1, len(decoder_pred_prosody_pred.shape))))).mean()
-
-            loss_ce, loss_dur = calculate_duration_and_ce_losses(duration_pred, duration_ground_truth, input_lengths)
-            
-            loss_s2s = 0
-            for _s2s_pred, _text_input, _text_length in zip(s2s_pred, texts, input_lengths):
-                loss_s2s += F.cross_entropy(_s2s_pred[:_text_length], _text_input[:_text_length])
-            loss_s2s /= texts.size(0)
-
+            loss_gen_adv = generator_adv_loss(waveforms_segments, decoder_pred_prosody_pred).mean()
+            loss_gen_wavlm_adv = wav_lm_loss(waveforms_segments.detach().squeeze(tuple(range(1, len(waveforms_segments.shape)))), decoder_pred_prosody_pred.squeeze(tuple(range(1, len(decoder_pred_prosody_pred.shape))))).mean()
 
             g_loss = loss_params.lambda_mel * loss_mel + \
-                     loss_params.lambda_F0 * loss_F0_rec + \
-                     loss_params.lambda_ce * loss_ce + \
-                     loss_params.lambda_norm * loss_norm_rec + \
+                     loss_params.lambda_F0 * loss_F0 + \
+                     loss_params.lambda_ce * loss_dur_ce + \
+                     loss_params.lambda_norm * loss_norm + \
                      loss_params.lambda_dur * loss_dur + \
-                     loss_params.lambda_gen * loss_gen_all + \
-                     loss_params.lambda_slm * loss_lm + \
+                     loss_params.lambda_gen * loss_gen_adv + \
+                     loss_params.lambda_slm * loss_gen_wavlm_adv + \
                      loss_params.lambda_sty * loss_sty + \
                      loss_params.lambda_diff * loss_diff + \
-                    loss_params.lambda_mono * loss_mono + \
-                    loss_params.lambda_s2s * loss_s2s
+                    loss_params.lambda_mono * loss_algn_mono + \
+                    loss_params.lambda_s2s * loss_algn_ce
             
             running_loss += loss_mel.item()
             accelerator.backward(g_loss)
@@ -688,24 +681,24 @@ def main(config_path):
             
             if (batch_idx+1)%log_interval == 0:
                 logger.info ('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f, S2S Loss: %.5f, Mono Loss: %.5f'
-                    %(epoch+1, epochs, batch_idx+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_ce, loss_norm_rec, loss_F0_rec, loss_lm, loss_gen_all, loss_sty, loss_diff, d_loss_slm, loss_gen_lm, loss_s2s, loss_mono))
+                    %(epoch+1, epochs, batch_idx+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_dur_ce, loss_norm, loss_F0, loss_gen_wavlm_adv, loss_gen_adv, loss_sty, loss_diff, d_loss_slm, loss_gen_lm, loss_algn_ce, loss_algn_mono))
                 
                 # Log metrics to wandb
                 wandb.log({
-                    'train/mel_loss': running_loss / log_interval,
-                    'train/gen_loss': loss_gen_all,
-                    'train/d_loss': d_loss,
-                    'train/ce_loss': loss_ce,
-                    'train/dur_loss': loss_dur,
-                    'train/slm_loss': loss_lm,
-                    'train/norm_loss': loss_norm_rec,
-                    'train/F0_loss': loss_F0_rec,
+                    'train/Mel Reconstruction Loss': running_loss / log_interval,
+                    'train/Generator Adversarial Loss': loss_gen_adv,
+                    'train/Discriminator Adversarial Loss': d_loss,
+                    'train/Duration Cross-Entropy Loss': loss_dur_ce,
+                    'train/Duration Loss': loss_dur,
+                    'train/WavLM Generator Adversarial Loss': loss_gen_wavlm_adv,
+                    'train/Energy Loss': loss_norm,
+                    'train/F0 Loss': loss_F0,
                     'train/sty_loss': loss_sty,
                     'train/diff_loss': loss_diff,
                     'train/d_loss_slm': d_loss_slm,
                     'train/gen_loss_slm': loss_gen_lm,
-                    'train/s2s_loss': loss_s2s,
-                    'train/mono_loss': loss_mono,
+                    'train/Alignment Cross-Entropy Loss': loss_algn_ce,
+                    'train/Alignment Monotonic Attention Loss': loss_algn_mono,
                     'iteration': iters
                 })
                 
@@ -728,27 +721,26 @@ def main(config_path):
                     if mels.size(-1) < 80:
                         continue
 
-                    with torch.no_grad():
-                        mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
-                        text_mask = length_to_mask(input_lengths).to(device)
+                    mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
+                    text_mask = length_to_mask(input_lengths).to(device)
 
-                        s2s_pred, s2s_attn = perform_text_alignment(model, mels, mask, texts)
+                    alignment_logits, alignment_attn = perform_text_alignment(model, mels, mask, texts)
 
-                        mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
-                        s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
+                    mask_ST = mask_from_lens(alignment_attn, input_lengths, mel_input_length // (2 ** n_down))
+                    alignment_attn_mono = maximum_path(alignment_attn, mask_ST)
 
-                        # encode
-                        text_encoded = model.text_encoder(texts, input_lengths, text_mask)
-                        aligned_encoded_text = (text_encoded @ s2s_attn_mono)
+                    # encode
+                    text_encoded = model.text_encoder(texts, input_lengths, text_mask)
+                    aligned_encoded_text = (text_encoded @ alignment_attn_mono)
 
-                        duration_ground_truth = s2s_attn_mono.sum(axis=-1).detach()
+                    duration_ground_truth = alignment_attn_mono.sum(axis=-1).detach()
 
                     # Extract style features for validation
                     utterance_prosodic_style, _ = extract_style_features(model, mels, mel_input_length)
                     
                     bert_embeddings = model.bert(bert_texts, attention_mask=(~text_mask).int())
                     bert_encoded = model.bert_encoder(bert_embeddings).transpose(-1, -2) 
-                    duration_pred, predictor_features = model.predictor(bert_encoded, utterance_prosodic_style, input_lengths, s2s_attn_mono, text_mask)
+                    duration_pred, predictor_features = model.predictor(bert_encoded, utterance_prosodic_style, input_lengths, alignment_attn_mono, text_mask)
 
                     # Create random segments for training
                     encoder_segments, predictor_segments, mel_targets_segments, waveforms_segments = create_random_segments(
