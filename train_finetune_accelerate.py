@@ -502,10 +502,10 @@ def main(config_path):
             d_gt = s2s_attn_mono.sum(axis=-1).detach()
 
             # Extract style features for the entire utterance
-            s_dur, gs = extract_style_features(model, mels, mel_input_length)
+            utterance_prosodic_style, utterance_acoustic_style = extract_style_features(model, mels, mel_input_length)
             
             # Combine features for denoiser ground truth
-            s_trg = torch.cat([gs, s_dur], dim=-1).detach()
+            target_style = torch.cat([utterance_acoustic_style, utterance_prosodic_style], dim=-1).detach()
 
             bert_dur = model.bert(bert_texts, attention_mask=(~text_mask).int())
             d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
@@ -521,7 +521,7 @@ def main(config_path):
             if epoch >= diffusion_training_epoch:
                 diffusion_loss, style_recon_loss, _, estimated_sigma = compute_diffusion_loss(
                     model=model,
-                    target_style=s_trg,
+                    target_style=target_style,
                     bert_embeddings=bert_dur,
                     multispeaker=multispeaker,
                     reference_features=ref if multispeaker else None,
@@ -538,7 +538,7 @@ def main(config_path):
                 loss_diff = 0
 
                 
-            d, p = model.predictor(d_en, s_dur, input_lengths, s2s_attn_mono, text_mask)
+            d, p = model.predictor(d_en, utterance_prosodic_style, input_lengths, s2s_attn_mono, text_mask)
                 
             # Create random segments for training
             encoder_features, predictor_features, mel_targets, waveforms = create_random_segments(
@@ -554,8 +554,9 @@ def main(config_path):
             if mel_targets.size(-1) < 80:
                 continue
             
-            s = model.style_encoder(mel_targets.unsqueeze(1))           
-            s_dur = model.predictor_encoder(mel_targets.unsqueeze(1))
+            # Extract style features from the random segments
+            segment_acoustic_style = model.style_encoder(mel_targets.unsqueeze(1))           
+            segment_prosodic_style = model.predictor_encoder(mel_targets.unsqueeze(1))
                 
             with torch.no_grad():
                 F0_real, _, F0 = model.pitch_extractor(mel_targets.unsqueeze(1))
@@ -564,13 +565,13 @@ def main(config_path):
                 N_real = log_norm(mel_targets.unsqueeze(1)).squeeze(1)
                 
                 y_rec_gt = waveforms.unsqueeze(1)
-                y_rec_gt_pred = model.decoder(encoder_features, F0_real, N_real, s)
+                y_rec_gt_pred = model.decoder(encoder_features, F0_real, N_real, segment_acoustic_style)
 
                 wav = y_rec_gt
 
-            F0_fake, N_fake = model.predictor.F0Ntrain(predictor_features, s_dur)
+            F0_fake, N_fake = model.predictor.F0Ntrain(predictor_features, segment_prosodic_style)
 
-            y_rec = model.decoder(encoder_features, F0_fake, N_fake, s)
+            y_rec = model.decoder(encoder_features, F0_fake, N_fake, segment_acoustic_style)
 
             loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
             loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
@@ -643,7 +644,7 @@ def main(config_path):
                                  waves, 
                                  mel_input_length,
                                  ref_texts, 
-                                 ref_lengths, use_ind, s_trg.detach(), ref if multispeaker else None)
+                                 ref_lengths, use_ind, target_style.detach(), ref if multispeaker else None)
 
                 if slm_out is not None:
                     d_loss_slm, loss_gen_lm, y_pred = slm_out
@@ -754,17 +755,12 @@ def main(config_path):
                         d_gt = s2s_attn_mono.sum(axis=-1).detach()
 
                     # Extract style features for validation
-                    s_dur, gs = extract_style_features(model, mels, mel_input_length)
+                    utterance_prosodic_style, _ = extract_style_features(model, mels, mel_input_length)
                     
-                    # Combine features for denoiser ground truth
-                    s_trg = torch.cat([gs, s_dur], dim=-1).detach()
-
                     bert_dur = model.bert(bert_texts, attention_mask=(~text_mask).int())
                     d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
-                    d, p = model.predictor(d_en, s_dur, 
-                                                        input_lengths, 
-                                                        s2s_attn_mono, 
-                                                        text_mask)
+                    d, p = model.predictor(d_en, utterance_prosodic_style, input_lengths, s2s_attn_mono, text_mask)
+
                     # Create random segments for training
                     encoder_features, predictor_features, mel_targets, waveforms = create_random_segments(
                         mel_input_length=mel_input_length,
@@ -779,14 +775,12 @@ def main(config_path):
                     if mel_targets.size(-1) < 80:
                         continue
 
-                    s = model.predictor_encoder(mel_targets.unsqueeze(1))
-
-                    F0_fake, N_fake = model.predictor.F0Ntrain(predictor_features, s)
-
+                    segment_prosodic_style = model.predictor_encoder(mel_targets.unsqueeze(1))
+                    F0_fake, N_fake = model.predictor.F0Ntrain(predictor_features, segment_prosodic_style)
                     _, loss_dur = calculate_duration_and_ce_losses(d, d_gt, input_lengths)
-                    s = model.style_encoder(mel_targets.unsqueeze(1))
-
-                    y_rec = model.decoder(encoder_features, F0_fake, N_fake, s)
+                    
+                    segment_acoustic_style = model.style_encoder(mel_targets.unsqueeze(1))
+                    y_rec = model.decoder(encoder_features, F0_fake, N_fake, segment_acoustic_style)
                     loss_mel = stft_loss(y_rec.squeeze(), waveforms.detach())
 
                     F0_real, _, F0 = model.pitch_extractor(mel_targets.unsqueeze(1)) 
