@@ -318,6 +318,51 @@ def compute_diffusion_loss(model, target_style, bert_embeddings, multispeaker=Fa
     
     return diffusion_loss, style_recon_loss, style_predictions, estimated_sigma
 
+def extract_style_features(model, mels, mel_input_lengths):
+    """
+    Extract prosodic and acoustic style features from mel spectrograms.
+    
+    This operation is done per-utterance because of the avgpool layer.
+    
+    Args:
+        model: Dictionary containing model components
+        mels: Tensor containing mel spectrograms [batch_size, n_mels, time]
+        mel_input_lengths: Tensor containing the lengths of mel spectrograms
+        
+    Returns:
+        tuple: (prosodic_styles, acoustic_styles)
+            - prosodic_styles: Global prosodic style features
+            - acoustic_styles: Global acoustic style features
+    """
+    prosodic_features = []
+    acoustic_features = []
+    
+    # Process each utterance in the batch individually
+    for batch_idx in range(len(mel_input_lengths)):
+        # Extract mel up to its actual length
+        mel = mels[batch_idx, :, :mel_input_lengths[batch_idx]]
+        
+        # Reshape to add batch and channel dimensions [1, 1, n_mels, time]
+        mel_expanded = mel.reshape(1, 1, *mel.shape)
+        
+        # Extract prosodic style features
+        prosodic = model.predictor_encoder(mel_expanded)
+        prosodic_features.append(prosodic)
+        
+        # Extract acoustic style features
+        acoustic = model.style_encoder(mel_expanded)
+        acoustic_features.append(acoustic)
+    
+    # Stack features from all utterances in batch
+    prosodic_features = torch.stack(prosodic_features)
+    acoustic_features = torch.stack(acoustic_features)
+    
+    # Remove extra dimensions (keeping batch dimension)
+    prosodic_features = prosodic_features.squeeze(tuple(range(1, len(prosodic_features.shape))))
+    acoustic_features = acoustic_features.squeeze(tuple(range(1, len(acoustic_features.shape))))
+    
+    return prosodic_features, acoustic_features
+
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
@@ -456,21 +501,11 @@ def main(config_path):
 
             d_gt = s2s_attn_mono.sum(axis=-1).detach()
 
-            # compute the style of the entire utterance
-            # this operation cannot be done in batch because of the avgpool layer (may need to work on masked avgpool)
-            ss = []
-            gs = []
-            for bib in range(len(mel_input_length)):
-                mel = mels[bib, :, :mel_input_length[bib]]
-                s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
-                ss.append(s)
-                s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
-                gs.append(s)
-
-            # Fix: Use squeeze(1) instead of squeeze() to avoid removing batch dimension
-            s_dur = torch.stack(ss); s_dur = s_dur.squeeze(tuple(range(1, len(s_dur.shape))))  # global prosodic styles
-            gs = torch.stack(gs); gs = gs.squeeze(tuple(range(1, len(gs.shape)))) # global acoustic styles
-            s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
+            # Extract style features for the entire utterance
+            s_dur, gs = extract_style_features(model, mels, mel_input_length)
+            
+            # Combine features for denoiser ground truth
+            s_trg = torch.cat([gs, s_dur], dim=-1).detach()
 
             bert_dur = model.bert(bert_texts, attention_mask=(~text_mask).int())
             d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
@@ -718,24 +753,15 @@ def main(config_path):
 
                         d_gt = s2s_attn_mono.sum(axis=-1).detach()
 
-                    ss = []
-                    gs = []
-
-                    for bib in range(len(mel_input_length)):
-                        mel = mels[bib, :, :mel_input_length[bib]]
-                        s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
-                        ss.append(s)
-                        s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
-                        gs.append(s)
-
-                    # Fix: Use squeeze(1) instead of squeeze() to avoid removing batch dimension
-                    s = torch.stack(ss); s = s.squeeze(tuple(range(1, len(s.shape))))
-                    gs = torch.stack(gs); gs = gs.squeeze(tuple(range(1, len(gs.shape))))
-                    s_trg = torch.cat([s, gs], dim=-1).detach()
+                    # Extract style features for validation
+                    s_dur, gs = extract_style_features(model, mels, mel_input_length)
+                    
+                    # Combine features for denoiser ground truth
+                    s_trg = torch.cat([gs, s_dur], dim=-1).detach()
 
                     bert_dur = model.bert(bert_texts, attention_mask=(~text_mask).int())
                     d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
-                    d, p = model.predictor(d_en, s, 
+                    d, p = model.predictor(d_en, s_dur, 
                                                         input_lengths, 
                                                         s2s_attn_mono, 
                                                         text_mask)
