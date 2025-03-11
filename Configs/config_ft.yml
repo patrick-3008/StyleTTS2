@@ -1,11 +1,11 @@
-log_dir: "Models/LJSpeech"
+log_dir: "Models/FineTune.SecondRun"
 save_freq: 1
 log_interval: 10
 device: "cuda"
 epochs: 25 # number of finetuning epoch
 batch_size: 1
 max_len: 200 # maximum number of frames
-pretrained_model: "Models/LibriTTS/epochs_2nd_00020.pth"
+pretrained_model: "Models/FineTune.FirstRun/epoch_2nd_00007.pth"
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: true # set to true if do not want to load epoch numbers and optimizer parameters
 
@@ -91,14 +91,16 @@ loss_params:
     lambda_ce: 20. # duration predictor probability output CE loss
     lambda_sty: 1. # style reconstruction loss
     lambda_diff: 1. # score matching loss
-    
-    diffusion_training_epoch: 5
-    joint_training_epoch: 15
 
+    # Note: Current values for training are only adequate for second stage finetuning.
+    diffusion_training_epoch: 0
+    joint_training_epoch: 10
+
+# Note: Current values for learnings rates are very low. This is only adequate for second stage finetuning.
 optimizer_params:
-  lr: 0.0001 # general learning rate
-  bert_lr: 0.00001 # learning rate for PLBERT
-  ft_lr: 0.0001 # learning rate for acoustic modules
+  lr: 0.00001 # general learning rate
+  bert_lr: 0.000001 # learning rate for PLBERT
+  ft_lr: 0.00001 # learning rate for acoustic modules
   
 slmadv_params:
   min_len: 400 # minimum length of samples

@@ -34,7 +34,7 @@ to_mel = torchaudio.transforms.MelSpectrogram(
     n_mels=80, n_fft=2048, win_length=1200, hop_length=300)
 mean, std = -4, 4
 
-EPOCH = 13
+EPOCH = 8
 
 def length_to_mask(lengths):
     mask = torch.arange(lengths.max()).unsqueeze(0).expand(lengths.shape[0], -1).type_as(lengths)
@@ -226,7 +226,7 @@ _ = [model[key].eval() for key in model]
 _ = [model[key].to(device) for key in model]
 
 # path = "/root/notebooks/voiceAI/arabic_audio_ai_fadi/external/style_tts2/Models/LibriTTS/epochs_2nd_00020.pth"
-path = f"Models/LJSpeech/epoch_2nd_{EPOCH-1:05d}.pth"
+path = f"Models/FineTune.FirstRun/epoch_2nd_{EPOCH-1:05d}.pth"
 
 params_whole = torch.load(path, map_location='cpu')
 print(f"Loading checkpoint from: {path}")

@@ -369,7 +369,7 @@ def main(config_path):
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
     
     # Initialize wandb
-    wandb.init(project="test", config=config)
+    wandb.init(project="finetune_second_run", config=config)
 
     # write logs
     file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
@@ -436,10 +436,10 @@ def main(config_path):
     
     # load models if there is a model
     start_epoch = 0
-    load_pretrained = config.get('pretrained_model', '') != '' and config.get('second_stage_load_pretrained', False)
+    load_pretrained = config['pretrained_model'] != '' and config['second_stage_load_pretrained']
     if load_pretrained:
         model, optimizer, start_epoch, iters = load_checkpoint(model,  optimizer, config['pretrained_model'],
-                                    load_only_params=config.get('load_only_params', True), ignore_modules=['bert'])
+                                    load_only_params=config['load_only_params'], ignore_modules=['bert'])
 
     n_down = model.text_aligner.n_down
 
