@@ -29,7 +29,7 @@ from accelerate import Accelerator
 accelerator = Accelerator()
 
 # simple fix for dataparallel that allows access to class attributes
-class MyDataParallel(torch.nn.DataParallel):
+class AttributeForwardingDataParallel(torch.nn.DataParallel):
     def __getattr__(self, name):
         try:
             return super().__getattr__(name)
@@ -414,15 +414,15 @@ def main(config_path):
     # DP
     for key in model:
         if key != "mpd" and key != "msd" and key != "wd":
-            model[key] = MyDataParallel(model[key])
+            model[key] = AttributeForwardingDataParallel(model[key])
             
     start_epoch = 0
     iters = 0
 
     
-    generator_adv_loss = MyDataParallel(GeneratorLoss(model.mpd, model.msd).to(device))
-    discriminator_adv_loss = MyDataParallel(DiscriminatorLoss(model.mpd, model.msd).to(device))
-    wav_lm_loss = MyDataParallel(WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device))
+    generator_adv_loss = AttributeForwardingDataParallel(GeneratorLoss(model.mpd, model.msd).to(device))
+    discriminator_adv_loss = AttributeForwardingDataParallel(DiscriminatorLoss(model.mpd, model.msd).to(device))
+    wav_lm_loss = AttributeForwardingDataParallel(WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device))
 
     load_pretrained = config.get('pretrained_model', '') != '' and config.get('second_stage_load_pretrained', False)
 
