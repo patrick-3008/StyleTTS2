@@ -310,7 +310,7 @@ def compute_diffusion_loss(model, target_style, bert_embeddings, sampler, multis
         ).mean()
     
     # Style reconstruction loss between predictions and target
-    style_recon_loss = F.l1_loss(style_predictions, target_style.detach())
+    style_recon_loss = F.l1_loss(style_predictions, target_style)
     
     return diffusion_loss, style_recon_loss 
 
@@ -579,7 +579,7 @@ def main(config_path):
 
             loss_mel = stft_loss(decoder_pred_prosody_pred, waveforms_segments)
             loss_gen_adv = generator_adv_loss(waveforms_segments, decoder_pred_prosody_pred).mean()
-            loss_gen_wavlm_adv = wav_lm_loss(waveforms_segments.detach().squeeze(tuple(range(1, len(waveforms_segments.shape)))), decoder_pred_prosody_pred.squeeze(tuple(range(1, len(decoder_pred_prosody_pred.shape))))).mean()
+            loss_gen_wavlm_adv = wav_lm_loss(waveforms_segments.squeeze(tuple(range(1, len(waveforms_segments.shape)))), decoder_pred_prosody_pred.squeeze(tuple(range(1, len(decoder_pred_prosody_pred.shape))))).mean()
 
             g_loss = loss_params.lambda_mel * loss_mel + \
                      loss_params.lambda_F0 * loss_F0 + \
@@ -627,7 +627,7 @@ def main(config_path):
                                  waves, 
                                  mel_input_length,
                                  ref_texts, 
-                                 ref_lengths, use_ind, target_style.detach(), ref if multispeaker else None)
+                                 ref_lengths, use_ind, target_style, ref if multispeaker else None)
 
                 if slm_out is not None:
                     d_loss_slm, loss_gen_lm, _ = slm_out
@@ -762,7 +762,7 @@ def main(config_path):
                     
                     segment_acoustic_style = model.style_encoder(mel_targets_segments)
                     decoder_pred_prosody_pred = model.decoder(encoder_segments, F0_fake, N_fake, segment_acoustic_style)
-                    loss_mel = stft_loss(decoder_pred_prosody_pred.squeeze(), waveforms_segments.detach())
+                    loss_mel = stft_loss(decoder_pred_prosody_pred.squeeze(), waveforms_segments)
 
                     F0_real, _, F0 = model.pitch_extractor(mel_targets_segments) 
 
