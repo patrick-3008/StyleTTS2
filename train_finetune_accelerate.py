@@ -186,14 +186,14 @@ def calculate_duration_and_ce_losses(duration_predictions, duration_targets, inp
     
     return loss_ce, loss_dur
 
-def create_random_segments(mel_input_length, asr, p, mels, waves, device, max_len=None):
+def create_random_segments(mel_input_length, aligned_encoded_text, predictor_features, mels, waves, device, max_len=None):
     """
     Create random segments from the input data for training.
     
     Args:
         mel_input_length: Tensor containing the lengths of mel spectrograms
-        asr: Tensor containing ASR features
-        p: Tensor containing predictor outputs
+        aligned_encoded_text: Tensor containing ASR features
+        predictor_features: Tensor containing predictor outputs
         mels: Tensor containing mel spectrograms
         waves: List of audio waveforms
         device: Device to place tensors on
@@ -210,8 +210,8 @@ def create_random_segments(mel_input_length, asr, p, mels, waves, device, max_le
     mel_len_content = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2 if max_len else float('inf'))
     
     # Initialize lists for collecting segments
-    encoder_features = []
-    predictor_features = []
+    encoder_segments = []
+    predictor_segments = []
     mel_targets = []
     waveforms = []
     
@@ -223,10 +223,10 @@ def create_random_segments(mel_input_length, asr, p, mels, waves, device, max_le
         content_start = np.random.randint(0, mel_length - mel_len_content)
         
         # Extract encoder features
-        encoder_features.append(asr[batch_idx, :, content_start:content_start+mel_len_content])
+        encoder_segments.append(aligned_encoded_text[batch_idx, :, content_start:content_start+mel_len_content])
         
         # Extract predictor features
-        predictor_features.append(p[batch_idx, :, content_start:content_start+mel_len_content])
+        predictor_segments.append(predictor_features[batch_idx, :, content_start:content_start+mel_len_content])
         
         # Extract ground truth mel segments (at 2x resolution)
         mel_targets.append(mels[batch_idx, :, (content_start * 2):((content_start+mel_len_content) * 2)])
@@ -240,13 +240,13 @@ def create_random_segments(mel_input_length, asr, p, mels, waves, device, max_le
         
     # Stack all segments into tensors
     return (
-        torch.stack(encoder_features),
-        torch.stack(predictor_features),
+        torch.stack(encoder_segments),
+        torch.stack(predictor_segments),
         torch.stack(mel_targets).detach(),
         torch.stack(waveforms).float().detach(),
     )
 
-def compute_diffusion_loss(model, target_style, bert_embeddings, multispeaker=False, reference_features=None, device=None, diffusion_steps_range=(3, 5)):
+def compute_diffusion_loss(model, target_style, bert_embeddings, sampler, multispeaker=False, reference_features=None, device=None, diffusion_steps_range=(3, 5)):
     """
     Compute the diffusion loss.
     
@@ -268,21 +268,17 @@ def compute_diffusion_loss(model, target_style, bert_embeddings, multispeaker=Fa
     """
     # Sample random number of diffusion steps
     num_diffusion_steps = np.random.randint(*diffusion_steps_range)
-    estimated_sigma = None
     
     # Estimate sigma data if configured
     diffusion_model = model.diffusion.module.diffusion
-    if diffusion_model.dist.estimate_sigma_data:
-        estimated_sigma = target_style.std(axis=-1).mean().item()  # batch-wise std estimation
-        diffusion_model.sigma_data = estimated_sigma
-
+    
     # Create input noise with same shape as target
     input_noise = torch.randn_like(target_style).unsqueeze(1).to(device)
     
     # Generate predictions based on whether it's multispeaker
     if multispeaker:
         # Generate style predictions using the sampler
-        style_predictions = model.sampler(
+        style_predictions = sampler(
             noise=input_noise,
             embedding=bert_embeddings,
             embedding_scale=1,
@@ -299,7 +295,7 @@ def compute_diffusion_loss(model, target_style, bert_embeddings, multispeaker=Fa
         ).mean()
     else:
         # Generate style predictions using the sampler
-        style_predictions = model.sampler(
+        style_predictions = sampler(
             noise=input_noise,
             embedding=bert_embeddings,
             embedding_scale=1,
@@ -316,7 +312,7 @@ def compute_diffusion_loss(model, target_style, bert_embeddings, multispeaker=Fa
     # Style reconstruction loss between predictions and target
     style_recon_loss = F.l1_loss(style_predictions, target_style.detach())
     
-    return diffusion_loss, style_recon_loss, style_predictions, estimated_sigma
+    return diffusion_loss, style_recon_loss 
 
 def extract_style_features(model, mels, mel_input_lengths):
     """
@@ -491,15 +487,15 @@ def main(config_path):
             s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
 
             # encode
-            t_en = model.text_encoder(texts, input_lengths, text_mask)
+            text_encoded = model.text_encoder(texts, input_lengths, text_mask)
             
             # 50% of chance of using monotonic version
             if bool(random.getrandbits(1)):
-                asr = (t_en @ s2s_attn)
+                aligned_encoded_text = (text_encoded @ s2s_attn)
             else:
-                asr = (t_en @ s2s_attn_mono)
+                aligned_encoded_text = (text_encoded @ s2s_attn_mono)
 
-            d_gt = s2s_attn_mono.sum(axis=-1).detach()
+            duration_ground_truth = s2s_attn_mono.sum(axis=-1).detach()
 
             # Extract style features for the entire utterance
             utterance_prosodic_style, utterance_acoustic_style = extract_style_features(model, mels, mel_input_length)
@@ -507,8 +503,8 @@ def main(config_path):
             # Combine features for denoiser ground truth
             target_style = torch.cat([utterance_acoustic_style, utterance_prosodic_style], dim=-1).detach()
 
-            bert_dur = model.bert(bert_texts, attention_mask=(~text_mask).int())
-            d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
+            bert_embeddings = model.bert(bert_texts, attention_mask=(~text_mask).int())
+            bert_encoded = model.bert_encoder(bert_embeddings).transpose(-1, -2) 
 
             with torch.no_grad():
                 # compute reference styles
@@ -519,17 +515,19 @@ def main(config_path):
             
             # denoiser training
             if epoch >= diffusion_training_epoch:
-                diffusion_loss, style_recon_loss, _, estimated_sigma = compute_diffusion_loss(
+                diffusion_loss, style_recon_loss = compute_diffusion_loss(
                     model=model,
                     target_style=target_style,
-                    bert_embeddings=bert_dur,
+                    bert_embeddings=bert_embeddings,
+                    sampler=sampler,
                     multispeaker=multispeaker,
                     reference_features=ref if multispeaker else None,
                     device=device
                 )
-                
-                if estimated_sigma is not None:
-                    running_std.append(estimated_sigma)
+
+                if model_params.diffusion.dist.estimate_sigma_data:
+                    model.diffusion.module.diffusion.sigma_data = target_style.std(axis=-1).mean().item() # batch-wise std estimation
+                    running_std.append(model.diffusion.module.diffusion.sigma_data)
                     
                 loss_diff = diffusion_loss
                 loss_sty = style_recon_loss
@@ -538,40 +536,40 @@ def main(config_path):
                 loss_diff = 0
 
                 
-            d, p = model.predictor(d_en, utterance_prosodic_style, input_lengths, s2s_attn_mono, text_mask)
+            duration_pred, predictor_features = model.predictor(bert_encoded, utterance_prosodic_style, input_lengths, s2s_attn_mono, text_mask)
                 
             # Create random segments for training
-            encoder_features, predictor_features, mel_targets, waveforms = create_random_segments(
+            encoder_segments, predictor_segments, mel_targets_segments, waveforms_segments = create_random_segments(
                 mel_input_length=mel_input_length,
-                asr=asr,
-                p=p,
+                aligned_encoded_text=aligned_encoded_text,
+                predictor_features=predictor_features,
                 mels=mels,
                 waves=waves,
                 device=device,
                 max_len=max_len
             )
             
-            if mel_targets.size(-1) < 80:
+            if mel_targets_segments.size(-1) < 80:
                 continue
             
             # Extract style features from the random segments
-            segment_acoustic_style = model.style_encoder(mel_targets.unsqueeze(1))           
-            segment_prosodic_style = model.predictor_encoder(mel_targets.unsqueeze(1))
+            segment_acoustic_style = model.style_encoder(mel_targets_segments.unsqueeze(1))           
+            segment_prosodic_style = model.predictor_encoder(mel_targets_segments.unsqueeze(1))
                 
             with torch.no_grad():
-                F0_real, _, F0 = model.pitch_extractor(mel_targets.unsqueeze(1))
+                F0_real, _, F0 = model.pitch_extractor(mel_targets_segments.unsqueeze(1))
                 F0 = F0.reshape(F0.shape[0], F0.shape[1] * 2, F0.shape[2], 1).squeeze()
 
-                N_real = log_norm(mel_targets.unsqueeze(1)).squeeze(1)
+                N_real = log_norm(mel_targets_segments.unsqueeze(1)).squeeze(1)
                 
-                y_rec_gt = waveforms.unsqueeze(1)
-                y_rec_gt_pred = model.decoder(encoder_features, F0_real, N_real, segment_acoustic_style)
+                y_rec_gt = waveforms_segments.unsqueeze(1)
+                y_rec_gt_pred = model.decoder(encoder_segments, F0_real, N_real, segment_acoustic_style)
 
                 wav = y_rec_gt
 
-            F0_fake, N_fake = model.predictor.F0Ntrain(predictor_features, segment_prosodic_style)
+            F0_fake, N_fake = model.predictor.F0Ntrain(predictor_segments, segment_prosodic_style)
 
-            y_rec = model.decoder(encoder_features, F0_fake, N_fake, segment_acoustic_style)
+            y_rec = model.decoder(encoder_segments, F0_fake, N_fake, segment_acoustic_style)
 
             loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
             loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
@@ -589,7 +587,7 @@ def main(config_path):
             loss_gen_all = generator_adv_loss(wav, y_rec).mean()
             loss_lm = wav_lm_loss(wav.detach().squeeze(tuple(range(1, len(wav.shape)))), y_rec.squeeze(tuple(range(1, len(y_rec.shape))))).mean()
 
-            loss_ce, loss_dur = calculate_duration_and_ce_losses(d, d_gt, input_lengths)
+            loss_ce, loss_dur = calculate_duration_and_ce_losses(duration_pred, duration_ground_truth, input_lengths)
             
             loss_s2s = 0
             for _s2s_pred, _text_input, _text_length in zip(s2s_pred, texts, input_lengths):
@@ -647,7 +645,7 @@ def main(config_path):
                                  ref_lengths, use_ind, target_style.detach(), ref if multispeaker else None)
 
                 if slm_out is not None:
-                    d_loss_slm, loss_gen_lm, y_pred = slm_out
+                    d_loss_slm, loss_gen_lm, _ = slm_out
 
                     # SLM generator loss
                     optimizer.zero_grad()
@@ -749,41 +747,41 @@ def main(config_path):
                         s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
 
                         # encode
-                        t_en = model.text_encoder(texts, input_lengths, text_mask)
-                        asr = (t_en @ s2s_attn_mono)
+                        text_encoded = model.text_encoder(texts, input_lengths, text_mask)
+                        aligned_encoded_text = (text_encoded @ s2s_attn_mono)
 
-                        d_gt = s2s_attn_mono.sum(axis=-1).detach()
+                        duration_ground_truth = s2s_attn_mono.sum(axis=-1).detach()
 
                     # Extract style features for validation
                     utterance_prosodic_style, _ = extract_style_features(model, mels, mel_input_length)
                     
-                    bert_dur = model.bert(bert_texts, attention_mask=(~text_mask).int())
-                    d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
-                    d, p = model.predictor(d_en, utterance_prosodic_style, input_lengths, s2s_attn_mono, text_mask)
+                    bert_embeddings = model.bert(bert_texts, attention_mask=(~text_mask).int())
+                    bert_encoded = model.bert_encoder(bert_embeddings).transpose(-1, -2) 
+                    duration_pred, predictor_features = model.predictor(bert_encoded, utterance_prosodic_style, input_lengths, s2s_attn_mono, text_mask)
 
                     # Create random segments for training
-                    encoder_features, predictor_features, mel_targets, waveforms = create_random_segments(
+                    encoder_segments, predictor_segments, mel_targets_segments, waveforms_segments = create_random_segments(
                         mel_input_length=mel_input_length,
-                        asr=asr,
-                        p=p,
+                        aligned_encoded_text=aligned_encoded_text,
+                        predictor_features=predictor_features,
                         mels=mels,
                         waves=waves,
                         device=device,
                         max_len=max_len
                     )
                     
-                    if mel_targets.size(-1) < 80:
+                    if mel_targets_segments.size(-1) < 80:
                         continue
 
-                    segment_prosodic_style = model.predictor_encoder(mel_targets.unsqueeze(1))
-                    F0_fake, N_fake = model.predictor.F0Ntrain(predictor_features, segment_prosodic_style)
-                    _, loss_dur = calculate_duration_and_ce_losses(d, d_gt, input_lengths)
+                    segment_prosodic_style = model.predictor_encoder(mel_targets_segments.unsqueeze(1))
+                    F0_fake, N_fake = model.predictor.F0Ntrain(predictor_segments, segment_prosodic_style)
+                    _, loss_dur = calculate_duration_and_ce_losses(duration_pred, duration_ground_truth, input_lengths)
                     
-                    segment_acoustic_style = model.style_encoder(mel_targets.unsqueeze(1))
-                    y_rec = model.decoder(encoder_features, F0_fake, N_fake, segment_acoustic_style)
-                    loss_mel = stft_loss(y_rec.squeeze(), waveforms.detach())
+                    segment_acoustic_style = model.style_encoder(mel_targets_segments.unsqueeze(1))
+                    y_rec = model.decoder(encoder_segments, F0_fake, N_fake, segment_acoustic_style)
+                    loss_mel = stft_loss(y_rec.squeeze(), waveforms_segments.detach())
 
-                    F0_real, _, F0 = model.pitch_extractor(mel_targets.unsqueeze(1)) 
+                    F0_real, _, F0 = model.pitch_extractor(mel_targets_segments.unsqueeze(1)) 
 
                     loss_F0 = F.l1_loss(F0_real, F0_fake) / 10
 
