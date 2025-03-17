@@ -260,38 +260,7 @@ def load_model(model_path):
     
     return model, model_params, sampler, epoch
 
-def ground_truth_inference(sample_idx, ref_s, model):
-    train_list, _ = get_data_path_list("Data/youtube_train_list.txt", "Data/youtube_val_list.txt")
-    dataset = FilePathDataset(train_list, "Youtube/wavs", sr=24000, validation=False)
-    batch = dataset[sample_idx]
 
-    _, mel_tensor, text_tensor, bert_text_tensor, _, _, _, _, _ = batch
-    mel_length = torch.tensor(mel_tensor.size(-1)).to(device).unsqueeze(0)
-    text_length = torch.tensor(text_tensor.size(-1)).to(device).unsqueeze(0)
-
-    mel_tensor = mel_tensor.to(device).unsqueeze(0)
-    text_tensor = text_tensor.to(device).unsqueeze(0)
-    bert_text_tensor = bert_text_tensor.to(device).unsqueeze(0)
-
-    with torch.no_grad():
-        n_down = model.text_aligner.n_down
-        mask = length_to_mask(mel_length // (2 ** n_down)).to(device)
-        text_mask = length_to_mask(text_length).to(device)
-
-        _, alignment_attn = perform_text_alignment(model, mel_tensor, mask, text_tensor)
-        mask_ST = mask_from_lens(alignment_attn, text_length, mel_length // (2 ** n_down))
-        alignment_attn_mono = maximum_path(alignment_attn, mask_ST)
-
-        text_encoded = model.text_encoder(text_tensor, text_length, text_mask)
-        aligned_encoded_text = text_encoded @ alignment_attn_mono
-
-        F0_real, _, _ = model.pitch_extractor(mel_tensor.unsqueeze(0))
-
-        N_real = log_norm(mel_tensor.unsqueeze(0)).squeeze(1)
-
-        out = model.decoder(aligned_encoded_text, F0_real, N_real, ref_s[:, :128])
-
-    return out.squeeze().cpu().numpy()[..., :]
 
 def predict_durations_and_alignment(model, d_en, s, input_lengths, text_mask):
     """
@@ -365,11 +334,40 @@ def predict_prosody(model, d, pred_aln_trg, s):
     
     return F0_pred, N_pred
 
-def inference(ref_s, model, sampler, device, acoustic_multiplier, prosodic_multiplier, diffusion_steps, embedding_scale):
+def perform_ground_truth_alignment(model, mel_tensor, text_tensor, mel_length, text_length):
+    """
+    Perform text-to-speech alignment using ground truth data.
+    
+    Args:
+        model: The StyleTTS2 model
+        mel_tensor: Mel spectrogram tensor
+        text_tensor: Text tensor
+        mel_length: Length of mel spectrogram
+        text_length: Length of text
+        device: Device to run computation on
+        
+    Returns:
+        alignment_attn_mono: Monotonic alignment attention
+    """
+    n_down = model.text_aligner.n_down
+    mask = length_to_mask(mel_length // (2 ** n_down)).to(device)
+
+    _, alignment_attn = perform_text_alignment(model, mel_tensor, mask, text_tensor)
+    mask_ST = mask_from_lens(alignment_attn, text_length, mel_length // (2 ** n_down))
+    alignment_attn_mono = maximum_path(alignment_attn, mask_ST)
+    
+    return alignment_attn_mono
+
+def inference(ref_s, model, sampler, **kwargs):
     train_list, _ = get_data_path_list("Data/youtube_train_list.txt", "Data/youtube_val_list.txt")
     dataset = FilePathDataset(train_list, "Youtube/wavs", sr=24000, validation=False)
     batch = dataset[0]
     _, mel_tensor, tokens, tokens_bert, _, _, _, _, _ = batch
+    
+    mel_length = torch.tensor(mel_tensor.size(-1)).to(device).unsqueeze(0)
+    text_length = torch.tensor(tokens.size(-1)).to(device).unsqueeze(0)
+
+    mel_tensor = mel_tensor.to(device).unsqueeze(0)
     tokens = tokens.to(device).unsqueeze(0)
     tokens_bert = tokens_bert.to(device).unsqueeze(0)
 
@@ -377,17 +375,19 @@ def inference(ref_s, model, sampler, device, acoustic_multiplier, prosodic_multi
         input_lengths = torch.LongTensor([tokens.shape[-1]]).to(device)
         text_mask = length_to_mask(input_lengths).to(device)
 
-        t_en = model.text_encoder(tokens, input_lengths, text_mask)
+        text_encoded = model.text_encoder(tokens, input_lengths, text_mask)
         bert_dur = model.bert(tokens_bert, attention_mask=(~text_mask).int())
         d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-        s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(device), embedding=bert_dur, embedding_scale=embedding_scale, num_steps=diffusion_steps).squeeze(1)
+        s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(device), embedding=bert_dur, embedding_scale=kwargs['embedding_scale'], num_steps=kwargs['diffusion_steps']).squeeze(1)
 
         acoustic_style = s_pred[:, :128]
         prosodic_style = s_pred[:, 128:]
 
-        acoustic_style = acoustic_multiplier * acoustic_style + (1 - acoustic_multiplier)  * ref_s[:, :128]
-        prosodic_style = prosodic_multiplier * prosodic_style + (1 - prosodic_multiplier)  * ref_s[:, 128:]
+        acoustic_style = kwargs['acoustic_multiplier'] * acoustic_style + (1 - kwargs['acoustic_multiplier'])  * ref_s[:, :128]
+        prosodic_style = kwargs['prosodic_multiplier'] * prosodic_style + (1 - kwargs['prosodic_multiplier'])  * ref_s[:, 128:]
+
+        alignment_attn_mono = perform_ground_truth_alignment(model, mel_tensor, tokens, mel_length, text_length)
 
         # Use the new function to get alignment matrix
         d, pred_aln_trg = predict_durations_and_alignment(model, d_en, prosodic_style, input_lengths, text_mask)
@@ -396,10 +396,14 @@ def inference(ref_s, model, sampler, device, acoustic_multiplier, prosodic_multi
         # Predict F0 and energy using the new function
         F0_pred, N_pred = predict_prosody(model, d, pred_aln_trg, prosodic_style)
 
-        asr = (t_en @ pred_aln_trg)
-        asr = shift_asr_frames(asr)
+        F0_real, _, _ = model.pitch_extractor(mel_tensor.unsqueeze(0))
+        N_real = log_norm(mel_tensor.unsqueeze(0)).squeeze(1)
 
-        out = model.decoder(asr, F0_pred, N_pred, acoustic_style.squeeze().unsqueeze(0))
+        aligned_text_encoded = text_encoded @ alignment_attn_mono if kwargs['duration_ground_truth'] else shift_asr_frames(text_encoded @ pred_aln_trg)
+        F0 = F0_real if kwargs['f0_ground_truth'] else F0_pred
+        N = N_real if kwargs['n_ground_truth'] else N_pred
+
+        out = model.decoder(aligned_text_encoded, F0, N, acoustic_style.squeeze().unsqueeze(0))
 
     return out.squeeze().cpu().numpy()[..., :]  # weird pulse at the end of the model, need to be fixed later
 
@@ -411,8 +415,10 @@ def inference(ref_s, model, sampler, device, acoustic_multiplier, prosodic_multi
 @click.option('--prosodic_multiplier', default=0.0, help="Beta parameter for style mixing")
 @click.option('--diffusion-steps', default=5, help="Number of diffusion steps")
 @click.option('--embedding-scale', default=1.0, help="Embedding scale")
-@click.option('--ground-truth', is_flag=True, help="Use ground truth for inference")
-def main(model_path, reference, output, acoustic_multiplier, prosodic_multiplier, diffusion_steps, embedding_scale, ground_truth):
+@click.option('--duration-ground-truth', is_flag=True, help="Use ground truth for duration")
+@click.option('--F0-ground-truth', is_flag=True, help="Use ground truth for F0")
+@click.option('--N-ground-truth', is_flag=True, help="Use ground truth for N")
+def main(model_path, reference, output, **kwargs):
     """
     Generate speech from text using StyleTTS2 model.
     
@@ -429,19 +435,12 @@ def main(model_path, reference, output, acoustic_multiplier, prosodic_multiplier
     ref_s = compute_style(reference, model, device)
     
     # Generate speech
-    if ground_truth:
-        pred = ground_truth_inference(0, ref_s, model)
-    else:
-        pred = inference(
-            ref_s, 
-            model, 
-            sampler, 
-            device, 
-            acoustic_multiplier=acoustic_multiplier, 
-            prosodic_multiplier=prosodic_multiplier, 
-            diffusion_steps=diffusion_steps, 
-            embedding_scale=embedding_scale
-        )
+    pred = inference(
+        ref_s, 
+        model, 
+        sampler, 
+        **kwargs
+    )
     
     # Save output
     os.makedirs(os.path.dirname(output), exist_ok=True)
