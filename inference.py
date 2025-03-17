@@ -1,14 +1,16 @@
 # load packages
+import click
 import random
-import string
 import re
 import unicodedata
 import yaml
 import numpy as np
+import scipy.io.wavfile as wavfile
 import torch
 import torchaudio
 import librosa
 from num2words import num2words
+import os
 
 from models import *
 from utils import *
@@ -184,7 +186,7 @@ def phonemize(text, global_phonemizer):
     tokens = separate_words_and_punctuation(text)
     # Process phonemes without tokenizer-specific handling
     phonemes = [global_phonemizer.phonemize([token], strip=True)[0] 
-                if token not in PUNCTUATION else token for token in tokens]
+                if token not in BertCharacterIndexer.PUNCTUATION else token for token in tokens]
 
     # Return appropriate result based on tokenization method
     return phonemes
@@ -192,7 +194,8 @@ def phonemize(text, global_phonemizer):
 def load_model(model_path):
     # Extract epoch number from path
     epoch_match = re.search(r'epoch_2nd_(\d+)', model_path)
-    epoch = int(epoch_match.group(1)) + 1 if epoch_match else 25
+    if not epoch_match: raise ValueError("Epoch not found in model path")
+    epoch = int(epoch_match.group(1)) + 1
     
     # Determine config path based on model path
     if "FineTune.FirstRun" in model_path:
@@ -233,7 +236,6 @@ def load_model(model_path):
     
     for key in model:
         if key in params:
-            print('%s loaded' % key)
             try:
                 model[key].load_state_dict(params[key])
             except:
@@ -256,11 +258,10 @@ def load_model(model_path):
     
     return model, model_params, sampler, epoch
 
-def inference(text, ref_s, model, model_params, sampler, device, alpha=0.2, beta=1.0, diffusion_steps=5, embedding_scale=1):
+def inference(text, ref_s, model, model_params, sampler, device, alpha, beta, diffusion_steps, embedding_scale):
     text = text.strip()
     phonemized_text = phonemize(text, global_phonemizer)
     ps = ' '.join(phonemized_text)
-    print(ps)
 
     tokens = char_indexer(ps)
     tokens_bert = bert_indexer(tokens)
@@ -320,13 +321,9 @@ def inference(text, ref_s, model, model_params, sampler, device, alpha=0.2, beta
 
     return out.squeeze().cpu().numpy()[..., :]  # weird pulse at the end of the model, need to be fixed later
 
-import click
-import os
-import scipy.io.wavfile as wavfile
-
 @click.command()
-@click.argument('model_path', type=click.Path(exists=True))
-@click.argument('text', type=str)
+@click.argument('model_path', type=click.Path(exists=True), default="Models/FineTune.Youtube/epoch_2nd_00022.pth")
+@click.argument('text', type=str, default="مرحبا، هذا اختبار.")
 @click.option('--reference', '-r', default="Youtube/wavs/train_1.wav", help="Reference audio file path")
 @click.option('--output', '-o', default="output_audio/synthesized.wav", help="Output audio file path")
 @click.option('--alpha', default=0.3, help="Alpha parameter for style mixing")
@@ -344,7 +341,7 @@ def main(model_path, text, reference, output, alpha, beta, diffusion_steps, embe
     print(f"Using device: {device}")
     
     # Load model
-    model, model_params, sampler, epoch = load_model(model_path)
+    model, model_params, sampler, _ = load_model(model_path)
     
     # Compute style from reference audio
     ref_s = compute_style(reference, model, device)
