@@ -1,40 +1,33 @@
+# load packages
+import random
+import string
+import re
+import unicodedata
+import yaml
+import numpy as np
 import torch
+import torchaudio
+import librosa
+from num2words import num2words
+
+from models import *
+from utils import *
+from char_indexer import BertCharacterIndexer, VanillaCharacterIndexer
+from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
+
+# set seeds for reproducibility
+random.seed(0)
+np.random.seed(0)
 torch.manual_seed(0)
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
-import random
-random.seed(0)
-
-import numpy as np
-np.random.seed(0)
-
-# load packages
-import time
-import random
-import yaml
-from munch import Munch
-import numpy as np
-import torch
-from torch import nn
-import torch.nn.functional as F
-import torchaudio
-import librosa
-from nltk.tokenize import word_tokenize
-
-from models import *
-from utils import *
-from text_utils import TextCleaner
-from char_indexer import BertCharacterIndexer, VanillaCharacterIndexer
-textclenaer = TextCleaner()
 char_indexer = VanillaCharacterIndexer()
 bert_indexer = BertCharacterIndexer()
 
 to_mel = torchaudio.transforms.MelSpectrogram(
     n_mels=80, n_fft=2048, win_length=1200, hop_length=300)
 mean, std = -4, 4
-
-EPOCH = 8
 
 def length_to_mask(lengths):
     mask = torch.arange(lengths.max()).unsqueeze(0).expand(lengths.shape[0], -1).type_as(lengths)
@@ -47,9 +40,9 @@ def preprocess(wave):
     mel_tensor = (torch.log(1e-5 + mel_tensor.unsqueeze(0)) - mean) / std
     return mel_tensor
 
-def compute_style(path):
+def compute_style(path, model, device):
     wave, sr = librosa.load(path, sr=24000)
-    audio, index = librosa.effects.trim(wave, top_db=30)
+    audio, _ = librosa.effects.trim(wave, top_db=30)
     if sr != 24000:
         audio = librosa.resample(audio, sr, 24000)
     mel_tensor = preprocess(audio).to(device)
@@ -61,12 +54,6 @@ def compute_style(path):
     return torch.cat([ref_s, ref_p], dim=1)
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-import unicodedata
-import re
-from num2words import num2words
-import string
-PUNCTUATION = ''.join(sorted(set(';:,.!?¡¿—…"«»“”‘’،؛؟٫٬٪﴾﴿ـ' + string.punctuation)))
 
 def is_whitespace(char):
     """Checks whether `chars` is a whitespace character."""
@@ -152,8 +139,8 @@ def separate_words_and_punctuation(text):
     """
     # Create a regex pattern that matches either a punctuation character or a non-space, non-punctuation sequence
     # We escape each punctuation character and join them into a character class
-    punct_pattern = '|'.join(re.escape(p) for p in PUNCTUATION)
-    pattern = f'({punct_pattern})|([^\s{re.escape("".join(PUNCTUATION))}]+)'
+    punct_pattern = '|'.join(re.escape(p) for p in BertCharacterIndexer.PUNCTUATION)
+    pattern = f'({punct_pattern})|([^\s{re.escape("".join(BertCharacterIndexer.PUNCTUATION))}]+)'
     
     # Find all matches
     tokens = re.findall(pattern, text)
@@ -202,66 +189,79 @@ def phonemize(text, global_phonemizer):
     # Return appropriate result based on tokenization method
     return phonemes
 
-# load phonemizer
+def load_model(model_path):
+    # Extract epoch number from path
+    epoch_match = re.search(r'epoch_2nd_(\d+)', model_path)
+    epoch = int(epoch_match.group(1)) + 1 if epoch_match else 25
+    
+    # Determine config path based on model path
+    if "FineTune.FirstRun" in model_path:
+        config_path = "Models/FineTune.FirstRun/config_ft.yml"
+    elif "FineTune.SecondRun" in model_path:
+        config_path = "Models/FineTune.SecondRun/config_ft.yml"
+    elif "FineTune.Youtube" in model_path:
+        config_path = "Models/FineTune.Youtube/config_ft.yml"
+    else:
+        config_path = "Models/FineTune.SecondRun/config_ft.yml"  # Default
+    
+    config = yaml.safe_load(open(config_path))
+    
+    # load pretrained ASR model
+    ASR_config = config.get('ASR_config', False)
+    ASR_path = config.get('ASR_path', False)
+    text_aligner = load_ASR_models(ASR_path, ASR_config)
+    
+    # load pretrained F0 model
+    F0_path = config.get('F0_path', False)
+    pitch_extractor = load_F0_models(F0_path)
+    
+    # load BERT model
+    from Utils.PLBERT.util import load_plbert
+    BERT_path = "Utils/PLBERT/arabic"
+    plbert = load_plbert(BERT_path)
+    
+    model_params = recursive_munch(config['model_params'])
+    model = build_model(model_params, text_aligner, pitch_extractor, plbert)
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    _ = [model[key].eval() for key in model]
+    _ = [model[key].to(device) for key in model]
+    
+    print(f"Loading checkpoint from: {model_path}")
+    params_whole = torch.load(model_path, map_location='cpu')
+    params = params_whole['net']
+    
+    for key in model:
+        if key in params:
+            print('%s loaded' % key)
+            try:
+                model[key].load_state_dict(params[key])
+            except:
+                from collections import OrderedDict
+                state_dict = params[key]
+                new_state_dict = OrderedDict()
+                for k, v in state_dict.items():
+                    name = k[7:]  # remove `module.`
+                    new_state_dict[name] = v
+                model[key].load_state_dict(new_state_dict, strict=False)
+    
+    _ = [model[key].eval() for key in model]
+    
+    sampler = DiffusionSampler(
+        model.diffusion.diffusion,
+        sampler=ADPM2Sampler(),
+        sigma_schedule=KarrasSchedule(sigma_min=0.0001, sigma_max=3.0, rho=9.0),  # empirical parameters
+        clamp=False
+    )
+    
+    return model, model_params, sampler, epoch
 
-config = yaml.safe_load(open("Models/LibriTTS/config.yml"))
-
-# load pretrained ASR model
-ASR_config = config.get('ASR_config', False)
-ASR_path = config.get('ASR_path', False)
-text_aligner = load_ASR_models(ASR_path, ASR_config)
-
-# load pretrained F0 model
-F0_path = config.get('F0_path', False)
-pitch_extractor = load_F0_models(F0_path)
-
-# load BERT model
-from Utils.PLBERT.util import load_plbert
-BERT_path = "Utils/PLBERT/arabic"
-plbert = load_plbert(BERT_path)
-
-model_params = recursive_munch(config['model_params'])
-model = build_model(model_params, text_aligner, pitch_extractor, plbert)
-_ = [model[key].eval() for key in model]
-_ = [model[key].to(device) for key in model]
-
-# path = "/root/notebooks/voiceAI/arabic_audio_ai_fadi/external/style_tts2/Models/LibriTTS/epochs_2nd_00020.pth"
-path = f"Models/FineTune.FirstRun/epoch_2nd_{EPOCH-1:05d}.pth"
-
-params_whole = torch.load(path, map_location='cpu')
-print(f"Loading checkpoint from: {path}")
-params = params_whole['net']
-
-for key in model:
-    if key in params:
-        print('%s loaded' % key)
-        try:
-            model[key].load_state_dict(params[key])
-        except:
-            from collections import OrderedDict
-            state_dict = params[key]
-            new_state_dict = OrderedDict()
-            for k, v in state_dict.items():
-                name = k[7:] # remove `module.`
-                new_state_dict[name] = v
-            model[key].load_state_dict(new_state_dict, strict=False)
-_ = [model[key].eval() for key in model]
-
-from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
-
-sampler = DiffusionSampler(
-    model.diffusion.diffusion,
-    sampler=ADPM2Sampler(),
-    sigma_schedule=KarrasSchedule(sigma_min=0.0001, sigma_max=3.0, rho=9.0), # empirical parameters
-    clamp=False
-)
-
-def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1):
+def inference(text, ref_s, model, model_params, sampler, device, alpha=0.2, beta=1.0, diffusion_steps=5, embedding_scale=1):
     text = text.strip()
     phonemized_text = phonemize(text, global_phonemizer)
     ps = ' '.join(phonemized_text)
+    print(ps)
 
-    # tokens = textclenaer(ps)
     tokens = char_indexer(ps)
     tokens_bert = bert_indexer(tokens)
     tokens.insert(0, 0)
@@ -277,12 +277,7 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
         bert_dur = model.bert(tokens_bert, attention_mask=(~text_mask).int())
         d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-        s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(device),
-                                          embedding=bert_dur,
-                                          embedding_scale=embedding_scale,
-                                            features=ref_s, # reference from the same speaker as the embedding
-                                             num_steps=diffusion_steps).squeeze(1)
-
+        s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(device), embedding=bert_dur, embedding_scale=embedding_scale, num_steps=diffusion_steps).squeeze(1)
 
         s = s_pred[:, 128:]
         ref = s_pred[:, :128]
@@ -290,15 +285,13 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
         ref = alpha * ref + (1 - alpha)  * ref_s[:, :128]
         s = beta * s + (1 - beta)  * ref_s[:, 128:]
 
-        d = model.predictor.text_encoder(d_en,
-                                         s, input_lengths, text_mask)
+        d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
 
         x, _ = model.predictor.lstm(d)
         duration = model.predictor.duration_proj(x)
 
         duration = torch.sigmoid(duration).sum(axis=-1)
         pred_dur = torch.round(duration.squeeze()).clamp(min=1)
-
 
         pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
         c_frame = 0
@@ -323,28 +316,50 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
             asr_new[:, :, 1:] = asr[:, :, 0:-1]
             asr = asr_new
 
-        out = model.decoder(asr,
-                                F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+        out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
 
+    return out.squeeze().cpu().numpy()[..., :]  # weird pulse at the end of the model, need to be fixed later
 
-    return out.squeeze().cpu().numpy()[..., :-50] # weird pulse at the end of the model, need to be fixed later
+import click
+import os
+import scipy.io.wavfile as wavfile
 
+@click.command()
+@click.argument('model_path', type=click.Path(exists=True))
+@click.argument('text', type=str)
+@click.option('--reference', '-r', default="Youtube/wavs/train_1.wav", help="Reference audio file path")
+@click.option('--output', '-o', default="output_audio/synthesized.wav", help="Output audio file path")
+@click.option('--alpha', default=0.3, help="Alpha parameter for style mixing")
+@click.option('--beta', default=0.7, help="Beta parameter for style mixing")
+@click.option('--diffusion-steps', default=5, help="Number of diffusion steps")
+@click.option('--embedding-scale', default=1.0, help="Embedding scale")
+def main(model_path, text, reference, output, alpha, beta, diffusion_steps, embedding_scale):
+    """
+    Generate speech from text using StyleTTS2 model.
+    
+    MODEL_PATH: Path to the model checkpoint
+    TEXT: Text to synthesize
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    # Load model
+    model, model_params, sampler, epoch = load_model(model_path)
+    
+    # Compute style from reference audio
+    ref_s = compute_style(reference, model, device)
+    
+    # Generate speech
+    print(f"Generating speech for: {text}")
+    wav = inference(text, ref_s, model, model_params, sampler, device, 
+                   alpha=alpha, beta=beta, 
+                   diffusion_steps=diffusion_steps, 
+                   embedding_scale=embedding_scale)
+    
+    # Save output
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    wavfile.write(output, 24000, wav.astype(np.float32))
+    print(f"Saved to: {output}")
 
-# text = ''' StyleTTS 2 is a text to speech model that leverages style diffusion and adversarial training with large speech language models to achieve human level text to speech synthesis. ''' # @param {type:"string"}
-# text = '''انا اسمي فادي''' # @param {type:"string"}
-text = '''مرحبا، اسمي فادي وأنا أعمل كمطور برمجيات في شركة تقنية متخصصة في الذكاء الاصطناعي.''' # @param {type:"string}
-
-reference_dicts = {}
-reference_dicts['validated_0'] = "Mozilla/wavs/train_0.wav"
-
-noise = torch.randn(1,1,256).to(device)
-for k, path in reference_dicts.items():
-    ref_s = compute_style(path)
-    wav = inference(text, ref_s, alpha=0.3, beta=0.7, diffusion_steps=5, embedding_scale=1)
-
-    # Save the synthesized audio and reference
-    import os
-    os.makedirs('output_audio', exist_ok=True)
-    import scipy.io.wavfile as wavfile
-    wavfile.write(f'output_audio/epoch_{EPOCH}_synthesized.wav', 24000, wav.astype(np.float32))
-    print(f"Saved to: output_audio/epoch_{EPOCH}_synthesized.wav")
+if __name__ == "__main__":
+    main()
