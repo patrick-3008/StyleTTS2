@@ -5,6 +5,7 @@ import re
 import unicodedata
 import yaml
 import numpy as np
+import shutil
 import scipy.io.wavfile as wavfile
 import torch
 import torchaudio
@@ -358,10 +359,9 @@ def perform_ground_truth_alignment(model, mel_tensor, text_tensor, mel_length, t
     
     return alignment_attn_mono
 
-def inference(ref_s, model, sampler, **kwargs):
-    train_list, _ = get_data_path_list("Data/youtube_train_list.txt", "Data/youtube_val_list.txt")
-    dataset = FilePathDataset(train_list, "Youtube/wavs", sr=24000, validation=False)
-    batch = dataset[0]
+def inference(ref_s, model, sampler, file_list, sample_idx, **kwargs):
+    dataset = FilePathDataset(file_list, "Youtube/wavs", sr=24000, validation=False)
+    batch = dataset[sample_idx]
     _, mel_tensor, tokens, tokens_bert, _, _, _, _, _ = batch
     
     mel_length = torch.tensor(mel_tensor.size(-1)).to(device).unsqueeze(0)
@@ -394,7 +394,11 @@ def inference(ref_s, model, sampler, **kwargs):
         pred_aln_trg = pred_aln_trg.unsqueeze(0).to(device)
 
         # Predict F0 and energy using the new function
-        F0_pred, N_pred = predict_prosody(model, d, pred_aln_trg, prosodic_style)
+
+        if kwargs['duration_ground_truth']:
+            F0_pred, N_pred = predict_prosody(model, d, alignment_attn_mono, prosodic_style)
+        else:
+            F0_pred, N_pred = predict_prosody(model, d, pred_aln_trg, prosodic_style)
 
         F0_real, _, _ = model.pitch_extractor(mel_tensor.unsqueeze(0))
         N_real = log_norm(mel_tensor.unsqueeze(0)).squeeze(1)
@@ -405,20 +409,62 @@ def inference(ref_s, model, sampler, **kwargs):
 
         out = model.decoder(aligned_text_encoded, F0, N, acoustic_style.squeeze().unsqueeze(0))
 
-    return out.squeeze().cpu().numpy()[..., :]  # weird pulse at the end of the model, need to be fixed later
+    return out.squeeze().cpu().numpy()[..., :] 
+
+def generate_and_save(ref_s, model, sampler, output_dir, file_list, sample_idx, duration_ground_truth=False, f0_ground_truth=False, n_ground_truth=False, **kwargs):
+    """
+    Generate speech with specified ground truth flags and save the output.
+    
+    Args:
+        ref_s: Reference style vector
+        model: The StyleTTS2 model
+        sampler: Diffusion sampler
+        output_dir: Directory to save output
+        filename: Base filename for output
+        duration_ground_truth: Whether to use ground truth durations
+        f0_ground_truth: Whether to use ground truth F0
+        n_ground_truth: Whether to use ground truth energy
+        **kwargs: Additional parameters for inference
+    """
+    # Set ground truth flags for this run
+    kwargs['duration_ground_truth'] = duration_ground_truth
+    kwargs['f0_ground_truth'] = f0_ground_truth
+    kwargs['n_ground_truth'] = n_ground_truth
+    
+    # Generate speech
+    pred = inference(ref_s, model, sampler, file_list, sample_idx, **kwargs)
+    
+    # Create output directory
+    filename = file_list[sample_idx].split('|')[0]
+    os.makedirs(f'{output_dir}/{filename}', exist_ok=True)
+    
+    # Add ground truth flags to filename
+    flags = []
+    if duration_ground_truth:
+        flags.append('dur_gt')
+    if f0_ground_truth:
+        flags.append('f0_gt')
+    if n_ground_truth:
+        flags.append('n_gt')
+    
+    if flags:
+        output_with_flags = f"{'_'.join(flags)}.wav"
+    else:
+        output_with_flags = "prediction_all_the_way.wav"
+    
+    wavfile.write(f'{output_dir}/{filename}/{output_with_flags}', 24000, pred.astype(np.float32))
+    print(f"Saved to: {output_dir}/{filename}/{output_with_flags}")
 
 @click.command()
 @click.argument('model_path', type=click.Path(exists=True), default="Models/FineTune.Youtube/epoch_00022.pth")
 @click.option('--reference', '-r', default="Youtube/wavs/train_1.wav", help="Reference audio file path")
-@click.option('--output', '-o', default="output_audio/synthesized.wav", help="Output audio file path")
+@click.option('--output_dir', '-o', default="output_audio/debug", help="Output audio file path")
 @click.option('--acoustic_multiplier', default=0.0, help="Alpha parameter for style mixing")
 @click.option('--prosodic_multiplier', default=0.0, help="Beta parameter for style mixing")
 @click.option('--diffusion-steps', default=5, help="Number of diffusion steps")
 @click.option('--embedding-scale', default=1.0, help="Embedding scale")
-@click.option('--duration-ground-truth', is_flag=True, help="Use ground truth for duration")
-@click.option('--F0-ground-truth', is_flag=True, help="Use ground truth for F0")
-@click.option('--N-ground-truth', is_flag=True, help="Use ground truth for N")
-def main(model_path, reference, output, **kwargs):
+@click.option('--sample-idx', default=0, help="Sample index to use for inference")
+def main(model_path, reference, output_dir, sample_idx, **kwargs):
     """
     Generate speech from text using StyleTTS2 model.
     
@@ -434,18 +480,30 @@ def main(model_path, reference, output, **kwargs):
     # Compute style from reference audio
     ref_s = compute_style(reference, model, device)
     
-    # Generate speech
-    pred = inference(
-        ref_s, 
-        model, 
-        sampler, 
-        **kwargs
-    )
+    # Get sample for inference
+    file_list, _ = get_data_path_list("Data/youtube_train_list.txt", "Data/youtube_val_list.txt")
+    filename = file_list[sample_idx].split('|')[0]
     
-    # Save output
-    os.makedirs(os.path.dirname(output), exist_ok=True)
-    wavfile.write(output, 24000, pred.astype(np.float32))
-    print(f"Saved to: {output}")
-
+    # Generate with different combinations of ground truth flags
+    print("Generating with all predictions (no ground truth)...")
+    generate_and_save(ref_s, model, sampler, output_dir, file_list, sample_idx, 
+                     duration_ground_truth=False, f0_ground_truth=False, n_ground_truth=False, **kwargs)
+    
+    print("Generating with all ground truth...")
+    generate_and_save(ref_s, model, sampler, output_dir, file_list, sample_idx, 
+                     duration_ground_truth=True, f0_ground_truth=True, n_ground_truth=True, **kwargs)
+    
+    print("Generating with duration and F0 ground truth...")
+    generate_and_save(ref_s, model, sampler, output_dir, file_list, sample_idx, 
+                     duration_ground_truth=True, f0_ground_truth=True, n_ground_truth=False, **kwargs)
+    
+    print("Generating with duration and energy ground truth...")
+    generate_and_save(ref_s, model, sampler, output_dir, file_list, sample_idx, 
+                     duration_ground_truth=True, f0_ground_truth=False, n_ground_truth=True, **kwargs)
+    
+    # Copy ground truth file
+    shutil.copy(f'Youtube/wavs/{filename}', f'{output_dir}/{filename}/ground_truth.wav')
+    print(f"Copied ground truth file to: {output_dir}/{filename}/ground_truth.wav")
+        
 if __name__ == "__main__":
     main()
