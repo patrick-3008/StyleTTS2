@@ -390,11 +390,11 @@ def inference(ref_s, model, sampler, device, acoustic_multiplier, prosodic_multi
         prosodic_style = prosodic_multiplier * prosodic_style + (1 - prosodic_multiplier)  * ref_s[:, 128:]
 
         # Use the new function to get alignment matrix
-        d, pred_aln_trg = predict_durations_and_alignment(model, d_en, s, input_lengths, text_mask)
+        d, pred_aln_trg = predict_durations_and_alignment(model, d_en, prosodic_style, input_lengths, text_mask)
         pred_aln_trg = pred_aln_trg.unsqueeze(0).to(device)
 
         # Predict F0 and energy using the new function
-        F0_pred, N_pred = predict_prosody(model, d, pred_aln_trg, s)
+        F0_pred, N_pred = predict_prosody(model, d, pred_aln_trg, prosodic_style)
 
         asr = (t_en @ pred_aln_trg)
         asr = shift_asr_frames(asr)
@@ -433,10 +433,16 @@ def main(model_path, text, reference, output, acoustic_multiplier, prosodic_mult
     if ground_truth:
         pred = ground_truth_inference(0, ref_s, model)
     else:
-        pred = inference(ref_s, model, sampler, device, 
-                   alpha=alpha, beta=beta, 
-                   diffusion_steps=diffusion_steps, 
-                   embedding_scale=embedding_scale)
+        pred = inference(
+            ref_s, 
+            model, 
+            sampler, 
+            device, 
+            acoustic_multiplier=acoustic_multiplier, 
+            prosodic_multiplier=prosodic_multiplier, 
+            diffusion_steps=diffusion_steps, 
+            embedding_scale=embedding_scale
+        )
     
     # Save output
     os.makedirs(os.path.dirname(output), exist_ok=True)
