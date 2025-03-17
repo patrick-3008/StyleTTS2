@@ -405,7 +405,6 @@ def inference(ref_s, model, sampler, device, acoustic_multiplier, prosodic_multi
 
 @click.command()
 @click.argument('model_path', type=click.Path(exists=True), default="Models/FineTune.Youtube/epoch_00022.pth")
-@click.argument('text', type=str, default="مرحبا، هذا اختبار.")
 @click.option('--reference', '-r', default="Youtube/wavs/train_1.wav", help="Reference audio file path")
 @click.option('--output', '-o', default="output_audio/synthesized.wav", help="Output audio file path")
 @click.option('--acoustic_multiplier', default=0.0, help="Alpha parameter for style mixing")
@@ -413,7 +412,7 @@ def inference(ref_s, model, sampler, device, acoustic_multiplier, prosodic_multi
 @click.option('--diffusion-steps', default=5, help="Number of diffusion steps")
 @click.option('--embedding-scale', default=1.0, help="Embedding scale")
 @click.option('--ground-truth', is_flag=True, help="Use ground truth for inference")
-def main(model_path, text, reference, output, acoustic_multiplier, prosodic_multiplier, diffusion_steps, embedding_scale, ground_truth):
+def main(model_path, reference, output, acoustic_multiplier, prosodic_multiplier, diffusion_steps, embedding_scale, ground_truth):
     """
     Generate speech from text using StyleTTS2 model.
     
