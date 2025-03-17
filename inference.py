@@ -15,7 +15,9 @@ import os
 from models import *
 from utils import *
 from char_indexer import BertCharacterIndexer, VanillaCharacterIndexer
+from meldataset import FilePathDataset
 from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
+from train_finetune_accelerate import perform_text_alignment
 
 # set seeds for reproducibility
 random.seed(0)
@@ -193,7 +195,7 @@ def phonemize(text, global_phonemizer):
 
 def load_model(model_path):
     # Extract epoch number from path
-    epoch_match = re.search(r'epoch_2nd_(\d+)', model_path)
+    epoch_match = re.search(r'epoch_(\d+)', model_path)
     if not epoch_match: raise ValueError("Epoch not found in model path")
     epoch = int(epoch_match.group(1)) + 1
     
@@ -258,17 +260,76 @@ def load_model(model_path):
     
     return model, model_params, sampler, epoch
 
-def inference(text, ref_s, model, model_params, sampler, device, alpha, beta, diffusion_steps, embedding_scale):
-    text = text.strip()
-    phonemized_text = phonemize(text, global_phonemizer)
-    ps = ' '.join(phonemized_text)
+def ground_truth_inference(sample_idx, ref_s, model):
+    train_list, _ = get_data_path_list("Data/youtube_train_list.txt", "Data/youtube_val_list.txt")
+    dataset = FilePathDataset(train_list, "Youtube/wavs", sr=24000, validation=False)
+    batch = dataset[sample_idx]
 
-    tokens = char_indexer(ps)
-    tokens_bert = bert_indexer(tokens)
-    tokens.insert(0, 0)
-    tokens_bert.insert(0, 0)
-    tokens = torch.LongTensor(tokens).to(device).unsqueeze(0)
-    tokens_bert = torch.LongTensor(tokens_bert).to(device).unsqueeze(0)
+    _, mel_tensor, text_tensor, bert_text_tensor, _, _, _, _, _ = batch
+    mel_length = torch.tensor(mel_tensor.size(-1)).to(device).unsqueeze(0)
+    text_length = torch.tensor(text_tensor.size(-1)).to(device).unsqueeze(0)
+
+    mel_tensor = mel_tensor.to(device).unsqueeze(0)
+    text_tensor = text_tensor.to(device).unsqueeze(0)
+    bert_text_tensor = bert_text_tensor.to(device).unsqueeze(0)
+
+    with torch.no_grad():
+        n_down = model.text_aligner.n_down
+        mask = length_to_mask(mel_length // (2 ** n_down)).to(device)
+        text_mask = length_to_mask(text_length).to(device)
+
+        _, alignment_attn = perform_text_alignment(model, mel_tensor, mask, text_tensor)
+        mask_ST = mask_from_lens(alignment_attn, text_length, mel_length // (2 ** n_down))
+        alignment_attn_mono = maximum_path(alignment_attn, mask_ST)
+
+        text_encoded = model.text_encoder(text_tensor, text_length, text_mask)
+        aligned_encoded_text = text_encoded @ alignment_attn_mono
+
+        F0_real, _, _ = model.pitch_extractor(mel_tensor.unsqueeze(0))
+
+        N_real = log_norm(mel_tensor.unsqueeze(0)).squeeze(1)
+
+        out = model.decoder(aligned_encoded_text, F0_real, N_real, ref_s[:, :128])
+
+    return out.squeeze().cpu().numpy()[..., :]
+
+def predict_durations_and_alignment(model, d_en, s, input_lengths, text_mask):
+    """
+    Predict phoneme durations and create alignment matrix.
+    
+    Args:
+        model: The StyleTTS2 model
+        d_en: Encoded BERT embeddings
+        s: Style vector
+        input_lengths: Length of input text tokens
+        text_mask: Mask for text tokens
+        
+    Returns:
+        pred_aln_trg: Alignment matrix mapping text to frames
+    """
+    d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+
+    x, _ = model.predictor.lstm(d)
+    duration = model.predictor.duration_proj(x)
+
+    duration = torch.sigmoid(duration).sum(axis=-1)
+    pred_dur = torch.round(duration.squeeze()).clamp(min=1)
+
+    pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
+    c_frame = 0
+    for i in range(pred_aln_trg.size(0)):
+        pred_aln_trg[i, c_frame:c_frame + int(pred_dur[i].data)] = 1
+        c_frame += int(pred_dur[i].data)
+    
+    return d, pred_aln_trg
+
+def inference(ref_s, model, sampler, device, alpha, beta, diffusion_steps, embedding_scale):
+    train_list, _ = get_data_path_list("Data/youtube_train_list.txt", "Data/youtube_val_list.txt")
+    dataset = FilePathDataset(train_list, "Youtube/wavs", sr=24000, validation=False)
+    batch = dataset[0]
+    _, mel_tensor, tokens, tokens_bert, _, _, _, _, _ = batch
+    tokens = tokens.to(device).unsqueeze(0)
+    tokens_bert = tokens_bert.to(device).unsqueeze(0)
 
     with torch.no_grad():
         input_lengths = torch.LongTensor([tokens.shape[-1]]).to(device)
@@ -286,36 +347,24 @@ def inference(text, ref_s, model, model_params, sampler, device, alpha, beta, di
         ref = alpha * ref + (1 - alpha)  * ref_s[:, :128]
         s = beta * s + (1 - beta)  * ref_s[:, 128:]
 
-        d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
-
-        x, _ = model.predictor.lstm(d)
-        duration = model.predictor.duration_proj(x)
-
-        duration = torch.sigmoid(duration).sum(axis=-1)
-        pred_dur = torch.round(duration.squeeze()).clamp(min=1)
-
-        pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
-        c_frame = 0
-        for i in range(pred_aln_trg.size(0)):
-            pred_aln_trg[i, c_frame:c_frame + int(pred_dur[i].data)] = 1
-            c_frame += int(pred_dur[i].data)
+        # Use the new function to get alignment matrix
+        d, pred_aln_trg = predict_durations_and_alignment(model, d_en, s, input_lengths, text_mask)
+        pred_aln_trg = pred_aln_trg.unsqueeze(0).to(device)
 
         # encode prosody
-        en = (d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(device))
-        if model_params.decoder.type == "hifigan":
-            asr_new = torch.zeros_like(en)
-            asr_new[:, :, 0] = en[:, :, 0]
-            asr_new[:, :, 1:] = en[:, :, 0:-1]
-            en = asr_new
+        en = (d.transpose(-1, -2) @ pred_aln_trg)
+        asr_new = torch.zeros_like(en)
+        asr_new[:, :, 0] = en[:, :, 0]
+        asr_new[:, :, 1:] = en[:, :, 0:-1]
+        en = asr_new
 
         F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
 
-        asr = (t_en @ pred_aln_trg.unsqueeze(0).to(device))
-        if model_params.decoder.type == "hifigan":
-            asr_new = torch.zeros_like(asr)
-            asr_new[:, :, 0] = asr[:, :, 0]
-            asr_new[:, :, 1:] = asr[:, :, 0:-1]
-            asr = asr_new
+        asr = (t_en @ pred_aln_trg)
+        asr_new = torch.zeros_like(asr)
+        asr_new[:, :, 0] = asr[:, :, 0]
+        asr_new[:, :, 1:] = asr[:, :, 0:-1]
+        asr = asr_new
 
         out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
 
@@ -326,11 +375,12 @@ def inference(text, ref_s, model, model_params, sampler, device, alpha, beta, di
 @click.argument('text', type=str, default="مرحبا، هذا اختبار.")
 @click.option('--reference', '-r', default="Youtube/wavs/train_1.wav", help="Reference audio file path")
 @click.option('--output', '-o', default="output_audio/synthesized.wav", help="Output audio file path")
-@click.option('--alpha', default=0.3, help="Alpha parameter for style mixing")
-@click.option('--beta', default=0.7, help="Beta parameter for style mixing")
+@click.option('--alpha', default=0.0, help="Alpha parameter for style mixing")
+@click.option('--beta', default=0.0, help="Beta parameter for style mixing")
 @click.option('--diffusion-steps', default=5, help="Number of diffusion steps")
 @click.option('--embedding-scale', default=1.0, help="Embedding scale")
-def main(model_path, text, reference, output, alpha, beta, diffusion_steps, embedding_scale):
+@click.option('--ground-truth', is_flag=True, help="Use ground truth for inference")
+def main(model_path, text, reference, output, alpha, beta, diffusion_steps, embedding_scale, ground_truth):
     """
     Generate speech from text using StyleTTS2 model.
     
@@ -341,21 +391,23 @@ def main(model_path, text, reference, output, alpha, beta, diffusion_steps, embe
     print(f"Using device: {device}")
     
     # Load model
-    model, model_params, sampler, _ = load_model(model_path)
+    model, _, sampler, _ = load_model(model_path)
     
     # Compute style from reference audio
     ref_s = compute_style(reference, model, device)
     
     # Generate speech
-    print(f"Generating speech for: {text}")
-    wav = inference(text, ref_s, model, model_params, sampler, device, 
+    if ground_truth:
+        pred = ground_truth_inference(0, ref_s, model)
+    else:
+        pred = inference(ref_s, model, sampler, device, 
                    alpha=alpha, beta=beta, 
                    diffusion_steps=diffusion_steps, 
                    embedding_scale=embedding_scale)
     
     # Save output
     os.makedirs(os.path.dirname(output), exist_ok=True)
-    wavfile.write(output, 24000, wav.astype(np.float32))
+    wavfile.write(output, 24000, pred.astype(np.float32))
     print(f"Saved to: {output}")
 
 if __name__ == "__main__":
