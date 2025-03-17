@@ -322,7 +322,7 @@ def inference(text, ref_s, model, model_params, sampler, device, alpha, beta, di
     return out.squeeze().cpu().numpy()[..., :]  # weird pulse at the end of the model, need to be fixed later
 
 @click.command()
-@click.argument('model_path', type=click.Path(exists=True), default="Models/FineTune.Youtube/epoch_2nd_00022.pth")
+@click.argument('model_path', type=click.Path(exists=True), default="Models/FineTune.Youtube/epoch_00022.pth")
 @click.argument('text', type=str, default="مرحبا، هذا اختبار.")
 @click.option('--reference', '-r', default="Youtube/wavs/train_1.wav", help="Reference audio file path")
 @click.option('--output', '-o', default="output_audio/synthesized.wav", help="Output audio file path")

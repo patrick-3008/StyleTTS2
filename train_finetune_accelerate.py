@@ -19,7 +19,6 @@ from models import *
 from losses import *
 from utils import *
 
-from Modules.slmadv import SLMAdversarialLoss
 from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
 
 from optimizers import build_optimizer
@@ -369,7 +368,7 @@ def main(config_path):
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
     
     # Initialize wandb
-    wandb.init(project="finetune_second_run", config=config)
+    wandb.init(project="finetune_youtube", config=config)
 
     # write logs
     file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
@@ -392,7 +391,6 @@ def main(config_path):
     
     loss_params = Munch(config['loss_params'])
     diffusion_training_epoch = loss_params.diffusion_training_epoch
-    joint_training_epoch = loss_params.joint_training_epoch
     
     optimizer_params = Munch(config['optimizer_params'])
     
@@ -418,7 +416,6 @@ def main(config_path):
             
     generator_adv_loss = AttributeForwardingDataParallel(GeneratorLoss(model.mpd, model.msd).to(device))
     discriminator_adv_loss = AttributeForwardingDataParallel(DiscriminatorLoss(model.mpd, model.msd).to(device))
-    wav_lm_loss = AttributeForwardingDataParallel(WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device))
 
     sampler = DiffusionSampler(
         model.diffusion.diffusion,
@@ -447,9 +444,6 @@ def main(config_path):
     
     running_std = []
 
-    slmadv_params = config['slmadv_params']
-    slmadv = SLMAdversarialLoss(model, wav_lm_loss, sampler, **slmadv_params)
-    
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
@@ -464,7 +458,7 @@ def main(config_path):
         _ = [model[key].train() for key in ['text_aligner', 'text_encoder', 'predictor', 'bert_encoder', 'bert', 'msd', 'mpd']]
 
         for batch_idx, batch in enumerate(train_dataloader):
-            waves, texts, bert_texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
+            waves, texts, bert_texts, input_lengths, _, _, mels, mel_input_length, ref_mels = batch
             _ = [b.to(device) for b in batch[1:]]
 
             if mels.size(-1) < 80:
@@ -560,7 +554,6 @@ def main(config_path):
                 F0 = F0.reshape(F0.shape[0], F0.shape[1] * 2, F0.shape[2], 1).squeeze()
 
                 N_real = log_norm(mel_targets_segments).squeeze(1)
-                decoder_pred_prosody_real = model.decoder(encoder_segments, F0_real, N_real, segment_acoustic_style)
 
             F0_fake, N_fake = model.predictor.F0Ntrain(predictor_segments, segment_prosodic_style)
             loss_F0 =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
@@ -571,15 +564,13 @@ def main(config_path):
             optimizer.zero_grad()
             d_loss = discriminator_adv_loss(waveforms_segments, decoder_pred_prosody_pred.detach()).mean()
             accelerator.backward(d_loss)
-            optimizer.step('msd')
-            optimizer.step('mpd')
+            optimizer.step('msd'); optimizer.step('mpd')
 
             # generator loss
             optimizer.zero_grad()
 
             loss_mel = stft_loss(decoder_pred_prosody_pred, waveforms_segments)
             loss_gen_adv = generator_adv_loss(waveforms_segments, decoder_pred_prosody_pred).mean()
-            loss_gen_wavlm_adv = wav_lm_loss(waveforms_segments.squeeze(tuple(range(1, len(waveforms_segments.shape)))), decoder_pred_prosody_pred.squeeze(tuple(range(1, len(decoder_pred_prosody_pred.shape))))).mean()
 
             g_loss = loss_params.lambda_mel * loss_mel + \
                      loss_params.lambda_F0 * loss_F0 + \
@@ -587,7 +578,6 @@ def main(config_path):
                      loss_params.lambda_norm * loss_norm + \
                      loss_params.lambda_dur * loss_dur + \
                      loss_params.lambda_gen * loss_gen_adv + \
-                     loss_params.lambda_slm * loss_gen_wavlm_adv + \
                      loss_params.lambda_sty * loss_diff_l1 + \
                      loss_params.lambda_diff * loss_diff_edm + \
                     loss_params.lambda_mono * loss_algn_mono + \
@@ -609,79 +599,11 @@ def main(config_path):
             if epoch >= diffusion_training_epoch:
                 optimizer.step('diffusion')
 
-            d_loss_slm, loss_gen_lm = 0, 0
-            if epoch >= joint_training_epoch:
-                # randomly pick whether to use in-distribution text
-                if np.random.rand() < 0.5:
-                    use_ind = True
-                else:
-                    use_ind = False
-
-                if use_ind:
-                    ref_lengths = input_lengths
-                    ref_texts = texts
-                    
-                slm_out = slmadv(batch_idx, 
-                                 waveforms_segments, 
-                                 decoder_pred_prosody_real, 
-                                 waves, 
-                                 mel_input_length,
-                                 ref_texts, 
-                                 ref_lengths, use_ind, target_style, ref if multispeaker else None)
-
-                if slm_out is not None:
-                    d_loss_slm, loss_gen_lm, _ = slm_out
-
-                    # SLM generator loss
-                    optimizer.zero_grad()
-                    accelerator.backward(loss_gen_lm)
-
-                    # compute the gradient norm
-                    total_norm = {}
-                    for key in model.keys():
-                        total_norm[key] = 0
-                        parameters = [p for p in model[key].parameters() if p.grad is not None and p.requires_grad]
-                        for p in parameters:
-                            param_norm = p.grad.detach().data.norm(2)
-                            total_norm[key] += param_norm.item() ** 2
-                        total_norm[key] = total_norm[key] ** 0.5
-
-                    # gradient scaling
-                    gradient_scaling = slmadv_params['scale']
-                    if total_norm['predictor'] > slmadv_params['thresh']:
-                        for key in model.keys():
-                            for p in model[key].parameters():
-                                if p.grad is not None:
-                                    p.grad *= (1 / total_norm['predictor'])
-
-                    for p in model.predictor.duration_proj.parameters():
-                        if p.grad is not None:
-                            p.grad *= gradient_scaling
-
-                    for p in model.predictor.lstm.parameters():
-                        if p.grad is not None:
-                            p.grad *= gradient_scaling
-
-                    for p in model.diffusion.parameters():
-                        if p.grad is not None:
-                            p.grad *= gradient_scaling
-                    
-                    optimizer.step('bert_encoder')
-                    optimizer.step('bert')
-                    optimizer.step('predictor')
-                    optimizer.step('diffusion')
-
-                    # SLM discriminator loss
-                    if d_loss_slm != 0:
-                        optimizer.zero_grad()
-                        accelerator.backward(d_loss_slm)
-                        optimizer.step('wd')
-
             iters = iters + 1
             
             if (batch_idx+1)%log_interval == 0:
-                logger.info ('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f, S2S Loss: %.5f, Mono Loss: %.5f'
-                    %(epoch+1, epochs, batch_idx+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_dur_ce, loss_norm, loss_F0, loss_gen_wavlm_adv, loss_gen_adv, loss_diff_l1, loss_diff_edm, d_loss_slm, loss_gen_lm, loss_algn_ce, loss_algn_mono))
+                logger.info ('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, S2S Loss: %.5f, Mono Loss: %.5f'
+                    %(epoch+1, epochs, batch_idx+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_dur_ce, loss_norm, loss_F0, loss_gen_adv, loss_diff_l1, loss_diff_edm, loss_algn_ce, loss_algn_mono))
                 
                 # Log metrics to wandb
                 wandb.log({
@@ -690,13 +612,10 @@ def main(config_path):
                     'train/Discriminator Adversarial Loss': d_loss,
                     'train/Duration Cross-Entropy Loss': loss_dur_ce,
                     'train/Duration Loss': loss_dur,
-                    'train/WavLM Embedding Similarity Adversarial Loss': loss_gen_wavlm_adv,
                     'train/Energy Loss': loss_norm,
                     'train/F0 Loss': loss_F0,
                     'train/Diffusion L1 Reconstruction Loss': loss_diff_l1,
                     'train/Diffusion EDM Loss': loss_diff_edm,
-                    'train/WavLM Discriminator Adversarial Loss': d_loss_slm,
-                    'train/WavLM Generator Adversarial Loss': loss_gen_lm,
                     'train/Alignment Cross-Entropy Loss': loss_algn_ce,
                     'train/Alignment Monotonic Attention Loss': loss_algn_mono,
                     'iteration': iters
@@ -715,7 +634,7 @@ def main(config_path):
                 optimizer.zero_grad()
 
                 try:
-                    waves, texts, bert_texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
+                    waves, texts, bert_texts, input_lengths, _, _, mels, mel_input_length, ref_mels = batch
                     _ = [b.to(device) for b in batch[1:]]
 
                     if mels.size(-1) < 80:
@@ -794,7 +713,7 @@ def main(config_path):
                 'val_loss': loss_test / iters_test,
                 'epoch': epoch,
             }
-            save_path = osp.join(log_dir, 'epoch_2nd_%05d.pth' % epoch)
+            save_path = osp.join(log_dir, 'epoch_%05d.pth' % epoch)
             print(f'Saving to {save_path}')
             torch.save(state, save_path)
 
