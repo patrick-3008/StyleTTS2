@@ -323,6 +323,32 @@ def predict_durations_and_alignment(model, d_en, s, input_lengths, text_mask):
     
     return d, pred_aln_trg
 
+def predict_prosody(model, d, pred_aln_trg, s):
+    """
+    Encode prosody and predict F0 and energy.
+    
+    Args:
+        model: The StyleTTS2 model
+        d: Duration predictor output
+        t_en: Text encoder output
+        pred_aln_trg: Alignment matrix mapping text to frames
+        s: Style vector
+        
+    Returns:
+        F0_pred: Predicted F0 values
+        N_pred: Predicted energy values
+    """
+    # encode prosody
+    en = (d.transpose(-1, -2) @ pred_aln_trg)
+    asr_new = torch.zeros_like(en)
+    asr_new[:, :, 0] = en[:, :, 0]
+    asr_new[:, :, 1:] = en[:, :, 0:-1]
+    en = asr_new
+
+    F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+    
+    return F0_pred, N_pred
+
 def inference(ref_s, model, sampler, device, alpha, beta, diffusion_steps, embedding_scale):
     train_list, _ = get_data_path_list("Data/youtube_train_list.txt", "Data/youtube_val_list.txt")
     dataset = FilePathDataset(train_list, "Youtube/wavs", sr=24000, validation=False)
@@ -351,14 +377,8 @@ def inference(ref_s, model, sampler, device, alpha, beta, diffusion_steps, embed
         d, pred_aln_trg = predict_durations_and_alignment(model, d_en, s, input_lengths, text_mask)
         pred_aln_trg = pred_aln_trg.unsqueeze(0).to(device)
 
-        # encode prosody
-        en = (d.transpose(-1, -2) @ pred_aln_trg)
-        asr_new = torch.zeros_like(en)
-        asr_new[:, :, 0] = en[:, :, 0]
-        asr_new[:, :, 1:] = en[:, :, 0:-1]
-        en = asr_new
-
-        F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+        # Predict F0 and energy using the new function
+        F0_pred, N_pred = predict_prosody(model, d, pred_aln_trg, s)
 
         asr = (t_en @ pred_aln_trg)
         asr_new = torch.zeros_like(asr)
