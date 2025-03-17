@@ -323,6 +323,22 @@ def predict_durations_and_alignment(model, d_en, s, input_lengths, text_mask):
     
     return d, pred_aln_trg
 
+def shift_asr_frames(asr):
+    """
+    Shift ASR frames to align with decoder input requirements.
+    The first frame stays the same, and all subsequent frames are shifted by one position.
+    
+    Args:
+        asr: ASR tensor from text encoder and alignment
+        
+    Returns:
+        asr_new: Shifted ASR tensor
+    """
+    asr_new = torch.zeros_like(asr)
+    asr_new[:, :, 0] = asr[:, :, 0]
+    asr_new[:, :, 1:] = asr[:, :, 0:-1]
+    return asr_new
+
 def predict_prosody(model, d, pred_aln_trg, s):
     """
     Encode prosody and predict F0 and energy.
@@ -349,7 +365,7 @@ def predict_prosody(model, d, pred_aln_trg, s):
     
     return F0_pred, N_pred
 
-def inference(ref_s, model, sampler, device, alpha, beta, diffusion_steps, embedding_scale):
+def inference(ref_s, model, sampler, device, acoustic_multiplier, prosodic_multiplier, diffusion_steps, embedding_scale):
     train_list, _ = get_data_path_list("Data/youtube_train_list.txt", "Data/youtube_val_list.txt")
     dataset = FilePathDataset(train_list, "Youtube/wavs", sr=24000, validation=False)
     batch = dataset[0]
@@ -367,11 +383,11 @@ def inference(ref_s, model, sampler, device, alpha, beta, diffusion_steps, embed
 
         s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(device), embedding=bert_dur, embedding_scale=embedding_scale, num_steps=diffusion_steps).squeeze(1)
 
-        s = s_pred[:, 128:]
-        ref = s_pred[:, :128]
+        acoustic_style = s_pred[:, :128]
+        prosodic_style = s_pred[:, 128:]
 
-        ref = alpha * ref + (1 - alpha)  * ref_s[:, :128]
-        s = beta * s + (1 - beta)  * ref_s[:, 128:]
+        acoustic_style = acoustic_multiplier * acoustic_style + (1 - acoustic_multiplier)  * ref_s[:, :128]
+        prosodic_style = prosodic_multiplier * prosodic_style + (1 - prosodic_multiplier)  * ref_s[:, 128:]
 
         # Use the new function to get alignment matrix
         d, pred_aln_trg = predict_durations_and_alignment(model, d_en, s, input_lengths, text_mask)
@@ -381,12 +397,9 @@ def inference(ref_s, model, sampler, device, alpha, beta, diffusion_steps, embed
         F0_pred, N_pred = predict_prosody(model, d, pred_aln_trg, s)
 
         asr = (t_en @ pred_aln_trg)
-        asr_new = torch.zeros_like(asr)
-        asr_new[:, :, 0] = asr[:, :, 0]
-        asr_new[:, :, 1:] = asr[:, :, 0:-1]
-        asr = asr_new
+        asr = shift_asr_frames(asr)
 
-        out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+        out = model.decoder(asr, F0_pred, N_pred, acoustic_style.squeeze().unsqueeze(0))
 
     return out.squeeze().cpu().numpy()[..., :]  # weird pulse at the end of the model, need to be fixed later
 
@@ -395,12 +408,12 @@ def inference(ref_s, model, sampler, device, alpha, beta, diffusion_steps, embed
 @click.argument('text', type=str, default="مرحبا، هذا اختبار.")
 @click.option('--reference', '-r', default="Youtube/wavs/train_1.wav", help="Reference audio file path")
 @click.option('--output', '-o', default="output_audio/synthesized.wav", help="Output audio file path")
-@click.option('--alpha', default=0.0, help="Alpha parameter for style mixing")
-@click.option('--beta', default=0.0, help="Beta parameter for style mixing")
+@click.option('--acoustic_multiplier', default=0.0, help="Alpha parameter for style mixing")
+@click.option('--prosodic_multiplier', default=0.0, help="Beta parameter for style mixing")
 @click.option('--diffusion-steps', default=5, help="Number of diffusion steps")
 @click.option('--embedding-scale', default=1.0, help="Embedding scale")
 @click.option('--ground-truth', is_flag=True, help="Use ground truth for inference")
-def main(model_path, text, reference, output, alpha, beta, diffusion_steps, embedding_scale, ground_truth):
+def main(model_path, text, reference, output, acoustic_multiplier, prosodic_multiplier, diffusion_steps, embedding_scale, ground_truth):
     """
     Generate speech from text using StyleTTS2 model.
     
