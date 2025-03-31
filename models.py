@@ -25,6 +25,8 @@ from Modules.discriminators import MultiPeriodDiscriminator, MultiResSpecDiscrim
 from munch import Munch
 import yaml
 
+from huggingface_hub import hf_hub_download
+
 class LearnedDownSample(nn.Module):
     def __init__(self, layer_type, dim_in):
         super().__init__()
@@ -694,9 +696,15 @@ def build_model(args, text_aligner, pitch_extractor, bert):
     
     return nets
 
-def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_modules=[]):
-    state = torch.load(path, map_location='cpu')
-    print("Loading checkpoint from: ", path)
+def load_checkpoint(model, optimizer, repo_id, filename, load_only_params=True, ignore_modules=[]):
+    model_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        repo_type="model"
+    )
+
+    state = torch.load(model_path, map_location='cpu')
+    print("Loading checkpoint from: ", model_path)
 
     params = state['net']
     for key in model:

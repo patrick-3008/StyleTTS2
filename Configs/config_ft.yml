@@ -5,7 +5,8 @@ device: "cuda"
 epochs: 25 # number of finetuning epoch
 batch_size: 16
 max_len: 400 # maximum number of frames
-pretrained_model: "Models/LibriTTS/epochs_2nd_00020.pth"
+pretrained_model_repo: "yl4579/StyleTTS2-LibriTTS"
+pretrained_model_filename: "Models/LibriTTS/epochs_2nd_00020.pth"
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: true # set to true if do not want to load epoch numbers and optimizer parameters
 

@@ -432,10 +432,8 @@ def main(config_path):
     
     # load models if there is a model
     start_epoch = 0
-    load_pretrained = config['pretrained_model'] != '' and config['second_stage_load_pretrained']
-    if load_pretrained:
-        model, optimizer, start_epoch, iters = load_checkpoint(model,  optimizer, config['pretrained_model'],
-                                    load_only_params=config['load_only_params'], ignore_modules=['bert'])
+    model, optimizer, start_epoch, iters = load_checkpoint(
+        model,  optimizer, config['pretrained_model_repo'], config['pretrained_model_filename'], load_only_params=config['load_only_params'], ignore_modules=['bert'])
 
     n_down = model.text_aligner.n_down
 
