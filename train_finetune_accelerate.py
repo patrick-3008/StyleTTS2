@@ -392,8 +392,18 @@ def main(config_path):
     
     device = accelerator.device
 
-    train_dataloader = build_dataloader(batch_size=batch_size, num_workers=2, device=device, **data_params)
-    val_dataloader = build_dataloader(validation=True, batch_size=batch_size, num_workers=0, device=device, **data_params)
+    from datasets import load_dataset
+    dataset = load_dataset("fadi77/arabic-audiobook-dataset-24khz", split="train")
+
+    # Split the dataset into train and validation sets (95% train, 5% validation)
+    train_test_split = dataset.train_test_split(test_size=0.05, seed=42)
+    train_dataset = train_test_split['train']
+    val_dataset = train_test_split['test']
+    
+    logger.info(f"Dataset split: {len(train_dataset)} training samples, {len(val_dataset)} validation samples")
+    
+    train_dataloader = build_dataloader(train_dataset, batch_size=batch_size, num_workers=2, device=device, **data_params)
+    val_dataloader = build_dataloader(val_dataset, validation=True, batch_size=batch_size, num_workers=0, device=device, **data_params)
     
     # Load pretrained models
     text_aligner, pitch_extractor, plbert = load_pretrained_models(config)
@@ -596,7 +606,7 @@ def main(config_path):
             
             if (batch_idx+1)%log_interval == 0:
                 logger.info ('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, S2S Loss: %.5f, Mono Loss: %.5f'
-                    %(epoch+1, epochs, batch_idx+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_dur_ce, loss_norm, loss_F0, loss_gen_adv, loss_diff_l1, loss_diff_edm, loss_algn_ce, loss_algn_mono))
+                    %(epoch+1, epochs, batch_idx+1, len(train_dataloader)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_dur_ce, loss_norm, loss_F0, loss_gen_adv, loss_diff_l1, loss_diff_edm, loss_algn_ce, loss_algn_mono))
                 
                 # Log metrics to wandb
                 wandb.log({
