@@ -29,10 +29,12 @@ def load_plbert(log_dir):
         if f.startswith("step_"): ckpts.append(f)
 
     iters = [int(f.split('_')[-1].split('.')[0]) for f in ckpts if os.path.isfile(os.path.join(log_dir, f))]
+    if len(iters) == 0:
+        raise ValueError(f"No PL-BERT checkpoints found in {log_dir}")
+
     iters = sorted(iters)[-1]
 
     checkpoint_path = log_dir + "/step_" + str(iters) + ".pth"
-    if not os.path.exists(checkpoint_path): checkpoint_path = checkpoint_path.replace('pth', 't7')
     print(f"Loading checkpoint from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     state_dict = checkpoint['net']
