@@ -382,9 +382,6 @@ def main(config_path):
     log_interval = config['log_interval']
 
     data_params = config['data_params']
-    sr = config['preprocess_params']['sr']
-    train_path = data_params['train_data']
-    val_path = data_params['val_data']
 
     max_len = config['max_len']
     
@@ -393,11 +390,10 @@ def main(config_path):
     
     optimizer_params = Munch(config['optimizer_params'])
     
-    train_list, val_list = get_data_path_list(train_path, val_path)
     device = accelerator.device
 
-    train_dataloader = build_dataloader(train_list, batch_size=batch_size, num_workers=2, device=device, **data_params)
-    val_dataloader = build_dataloader(val_list, validation=True, batch_size=batch_size, num_workers=0, device=device, **data_params)
+    train_dataloader = build_dataloader(batch_size=batch_size, num_workers=2, device=device, **data_params)
+    val_dataloader = build_dataloader(validation=True, batch_size=batch_size, num_workers=0, device=device, **data_params)
     
     # Load pretrained models
     text_aligner, pitch_extractor, plbert = load_pretrained_models(config)
@@ -455,7 +451,7 @@ def main(config_path):
         _ = [model[key].train() for key in ['text_aligner', 'text_encoder', 'predictor', 'bert_encoder', 'bert', 'msd', 'mpd']]
 
         for batch_idx, batch in enumerate(train_dataloader):
-            waves, texts, bert_texts, input_lengths, _, _, mels, mel_input_length, ref_mels = batch
+            waves, texts, bert_texts, input_lengths, mels, mel_input_length, ref_mels = batch
             _ = [b.to(device) for b in batch[1:]]
 
             if mels.size(-1) < 80:
@@ -631,7 +627,7 @@ def main(config_path):
                 optimizer.zero_grad()
 
                 try:
-                    waves, texts, bert_texts, input_lengths, _, _, mels, mel_input_length, ref_mels = batch
+                    waves, texts, bert_texts, input_lengths, mels, mel_input_length, ref_mels = batch
                     _ = [b.to(device) for b in batch[1:]]
 
                     if mels.size(-1) < 80:

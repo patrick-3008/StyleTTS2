@@ -28,6 +28,7 @@ class VanillaCharacterIndexer:
     _punctuation = ';:,.!?¡¿—…"«»“” '
     _letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
     _letters_ipa = "ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ"
+    _unknown = "U"
 
     # Export all symbols:
     symbols = [_pad] + list(_punctuation) + list(_letters) + list(_letters_ipa)
@@ -40,10 +41,5 @@ class VanillaCharacterIndexer:
         self.word_index_dictionary = dicts
 
     def __call__(self, text):
-        indexes = []
-        for char in text:
-            try:
-                indexes.append(self.word_index_dictionary[char])
-            except KeyError:
-                pass
-        return indexes
+        return [self.word_index_dictionary[char] if char in self.word_index_dictionary 
+                else self.word_index_dictionary[VanillaCharacterIndexer._unknown] for char in text]
