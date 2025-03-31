@@ -456,7 +456,7 @@ def generate_and_save(ref_s, model, sampler, output_dir, file_list, sample_idx, 
     print(f"Saved to: {output_dir}/{filename}/{output_with_flags}")
 
 @click.command()
-@click.argument('model_path', type=click.Path(exists=True), default="Models/FineTune.Youtube/epoch_00022.pth")
+@click.argument('model_path', type=click.Path(exists=True), default="Models/FineTune.Youtube/epoch_00024.pth")
 @click.option('--reference', '-r', default="Youtube/wavs/train_1.wav", help="Reference audio file path")
 @click.option('--output_dir', '-o', default="output_audio/debug", help="Output audio file path")
 @click.option('--acoustic_multiplier', default=0.0, help="Alpha parameter for style mixing")
@@ -481,7 +481,7 @@ def main(model_path, reference, output_dir, sample_idx, **kwargs):
     ref_s = compute_style(reference, model, device)
     
     # Get sample for inference
-    file_list, _ = get_data_path_list("Data/youtube_train_list.txt", "Data/youtube_val_list.txt")
+    _, file_list = get_data_path_list("Data/youtube_train_list.txt", "Data/youtube_val_list.txt")
     filename = file_list[sample_idx].split('|')[0]
     
     # Generate with different combinations of ground truth flags
@@ -501,6 +501,10 @@ def main(model_path, reference, output_dir, sample_idx, **kwargs):
     generate_and_save(ref_s, model, sampler, output_dir, file_list, sample_idx, 
                      duration_ground_truth=True, f0_ground_truth=False, n_ground_truth=True, **kwargs)
     
+    print("Generating with duration ground truth...")
+    generate_and_save(ref_s, model, sampler, output_dir, file_list, sample_idx, 
+                     duration_ground_truth=True, f0_ground_truth=False, n_ground_truth=False, **kwargs)
+
     # Copy ground truth file
     shutil.copy(f'Youtube/wavs/{filename}', f'{output_dir}/{filename}/ground_truth.wav')
     print(f"Copied ground truth file to: {output_dir}/{filename}/ground_truth.wav")
