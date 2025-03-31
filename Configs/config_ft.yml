@@ -12,7 +12,8 @@ load_only_params: true # set to true if do not want to load epoch numbers and op
 F0_path: "Utils/JDC/bst.t7"
 ASR_config: "Utils/ASR/config.yml"
 ASR_path: "Utils/ASR/epoch_00080.pth"
-PLBERT_dir: 'Utils/PLBERT/arabic'
+PLBERT_repo_id: "fadi77/pl-bert"
+PLBERT_dirname: "models/mlm_only_with_diacritics"
 
 data_params:
   train_data: "Data/youtube_train_list.txt"

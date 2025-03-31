@@ -3,15 +3,14 @@
 import string
 
 class BertCharacterIndexer:
-    PAD = "Ø"
+    PAD = "P"
     PUNCTUATION = ''.join(sorted(set(';:,.!?¡¿—…"«»“”‘’،؛؟٫٬٪﴾﴿ـ' + string.punctuation)))
     LETTERS_IPA = 'ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘̩ᵻ'
-    LATIN_LETTERS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
-    PHONEME_MASK = "×"
+    LATIN_LETTERS = 'abcdefghijklmnopqrstuvwxyz'
+    PHONEME_MASK = "M"
     PHONEME_SEPARATOR = " "
     # NOTE: '¤' is a valid 'unknown' character because it is different from all the characters above it. In English PL-BERT, 'U' was used as the unknown character which was not ideal as it was part of the English alphabet
-    UNKNOWN='¤'
-
+    UNKNOWN='U'
     # Export all symbols:
     symbols = [PAD] + list(PUNCTUATION) + list(LETTERS_IPA) + list(LATIN_LETTERS) + [PHONEME_MASK] + [PHONEME_SEPARATOR] + [UNKNOWN]
 

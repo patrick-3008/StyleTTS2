@@ -7,6 +7,8 @@ from char_indexer import BertCharacterIndexer
 
 symbols = BertCharacterIndexer.symbols
 
+from huggingface_hub import hf_hub_download
+
 class CustomAlbert(AlbertModel):
     def forward(self, *args, **kwargs):
         # Call the original forward method
@@ -14,29 +16,15 @@ class CustomAlbert(AlbertModel):
 
         # Only return the last_hidden_state
         return outputs.last_hidden_state
-
-
-def load_plbert(log_dir):
-    config_path = os.path.join(log_dir, "config.yml")
+    
+def _load_plbert(config_path, model_path):
     plbert_config = yaml.safe_load(open(config_path))
     
     albert_base_configuration = AlbertConfig(**plbert_config['model_params'], vocab_size=len(symbols))
     bert = CustomAlbert(albert_base_configuration)
 
-    files = os.listdir(log_dir)
-    ckpts = []
-    for f in os.listdir(log_dir):
-        if f.startswith("step_"): ckpts.append(f)
-
-    iters = [int(f.split('_')[-1].split('.')[0]) for f in ckpts if os.path.isfile(os.path.join(log_dir, f))]
-    if len(iters) == 0:
-        raise ValueError(f"No PL-BERT checkpoints found in {log_dir}")
-
-    iters = sorted(iters)[-1]
-
-    checkpoint_path = log_dir + "/step_" + str(iters) + ".pth"
-    print(f"Loading checkpoint from: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    print(f"Loading checkpoint from: {model_path}")
+    checkpoint = torch.load(model_path, map_location='cpu')
     state_dict = checkpoint['net']
     from collections import OrderedDict
     new_state_dict = OrderedDict()
@@ -49,3 +37,18 @@ def load_plbert(log_dir):
     bert.load_state_dict(new_state_dict, strict=False)
     
     return bert
+
+def load_plbert(repo_id, dirname):
+    config_path = hf_hub_download(
+        repo_id=repo_id,       # or e.g. "stabilityai/stable-diffusion-2"
+        filename=f"{dirname}/config.yml",
+        repo_type="model",                       # or "dataset", or "space"
+    )
+    
+    model_path = hf_hub_download(
+        repo_id=repo_id,       # or e.g. "stabilityai/stable-diffusion-2"
+        filename=f"{dirname}/model.pth",
+        repo_type="model",                       # or "dataset", or "space"
+    )
+
+    return _load_plbert(config_path, model_path)

@@ -60,8 +60,7 @@ def load_pretrained_models(config):
     pitch_extractor = load_F0_models(F0_path)
     
     # load PL-BERT model
-    BERT_path = config['PLBERT_dir']
-    plbert = load_plbert(BERT_path)
+    plbert = load_plbert(config['PLBERT_repo_id'], config['PLBERT_dirname'])
     
     return text_aligner, pitch_extractor, plbert
 
