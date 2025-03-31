@@ -1,10 +1,10 @@
-log_dir: "Models/LJSpeech"
+log_dir: "Models/FineTune.AudioBook"
 save_freq: 1
 log_interval: 10
 device: "cuda"
 epochs: 25 # number of finetuning epoch
-batch_size: 1
-max_len: 200 # maximum number of frames
+batch_size: 16
+max_len: 400 # maximum number of frames
 pretrained_model: "Models/LibriTTS/epochs_2nd_00020.pth"
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: true # set to true if do not want to load epoch numbers and optimizer parameters
@@ -15,10 +15,10 @@ ASR_path: "Utils/ASR/epoch_00080.pth"
 PLBERT_dir: 'Utils/PLBERT/arabic'
 
 data_params:
-  train_data: "Data/mozilla_train_list.txt"
-  val_data: "Data/mozilla_test_list.txt"
-  root_path: "Mozilla/wavs"
-  OOD_data: "Data/mozilla_train_list.txt"
+  train_data: "Data/youtube_train_list.txt"
+  val_data: "Data/youtube_val_list.txt"
+  root_path: "Youtube/wavs"
+  OOD_data: "Data/youtube_train_list.txt"
   min_length: 50 # sample until texts with this size are obtained for OOD texts
 
 preprocess_params:
@@ -91,10 +91,12 @@ loss_params:
     lambda_ce: 20. # duration predictor probability output CE loss
     lambda_sty: 1. # style reconstruction loss
     lambda_diff: 1. # score matching loss
-    
-    diffusion_training_epoch: 5
-    joint_training_epoch: 15
 
+    # Note: Current values for training are only adequate for second stage finetuning.
+    diffusion_training_epoch: 5
+    joint_training_epoch: 100
+
+# Note: Current values for learnings rates are very low. This is only adequate for second stage finetuning.
 optimizer_params:
   lr: 0.0001 # general learning rate
   bert_lr: 0.00001 # learning rate for PLBERT
@@ -104,7 +106,7 @@ slmadv_params:
   min_len: 400 # minimum length of samples
   max_len: 500 # maximum length of samples
   batch_percentage: 0.5 # to prevent out of memory, only use half of the original batch size
-  iter: 10 # update the discriminator every this iterations of generator update
+  skip_update: 10 # update the discriminator every this iterations of generator update
   thresh: 5 # gradient norm above which the gradient is scaled
   scale: 0.01 # gradient scaling factor for predictors from SLM discriminators
   sig: 1.5 # sigma for differentiable duration modeling

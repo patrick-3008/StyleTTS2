@@ -10,7 +10,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
+from torch.nn.utils import  spectral_norm
+from torch.nn.utils.parametrizations import weight_norm
 
 from Utils.ASR.models import ASRCNN
 from Utils.JDC.model import JDCNet
@@ -695,10 +696,11 @@ def build_model(args, text_aligner, pitch_extractor, bert):
 
 def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_modules=[]):
     state = torch.load(path, map_location='cpu')
+    print("Loading checkpoint from: ", path)
+
     params = state['net']
     for key in model:
         if key in params and key not in ignore_modules:
-            print('%s loaded' % key)
             model[key].load_state_dict(params[key], strict=False)
     _ = [model[key].eval() for key in model]
     
