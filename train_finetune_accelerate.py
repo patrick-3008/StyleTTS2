@@ -357,6 +357,152 @@ def extract_style_features(model, mels, mel_input_lengths):
     
     return prosodic_features, acoustic_features
 
+def validate_model(model, val_dataloader, optimizer, device, n_down, max_len, stft_loss, epoch):
+    """
+    Perform validation on the model and compute validation metrics.
+    
+    Args:
+        model: Dictionary of model components
+        val_dataloader: Validation data loader
+        optimizer: Model optimizer
+        device: Device to run validation on
+        n_down: Number of downsampling layers
+        max_len: Maximum sequence length
+        stft_loss: STFT loss function
+    
+    Returns:
+        tuple: Average mel loss, duration loss, and F0 loss
+    """
+    loss_test = 0
+    loss_align = 0
+    loss_f = 0
+    _ = [model[key].eval() for key in model]
+
+    with torch.no_grad():
+        iters_test = 0
+        for _, batch in enumerate(val_dataloader):
+            optimizer.zero_grad()
+
+            waves, texts, bert_texts, input_lengths, mels, mel_input_length, ref_mels = batch
+            _ = [b.to(device) for b in batch[1:]]
+
+            if mels.size(-1) < 80:
+                continue
+
+            mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
+            text_mask = length_to_mask(input_lengths).to(device)
+
+            alignment_logits, alignment_attn = perform_text_alignment(model, mels, mask, texts)
+
+            mask_ST = mask_from_lens(alignment_attn, input_lengths, mel_input_length // (2 ** n_down))
+            alignment_attn_mono = maximum_path(alignment_attn, mask_ST)
+
+            # encode
+            text_encoded = model.text_encoder(texts, input_lengths, text_mask)
+            aligned_encoded_text = (text_encoded @ alignment_attn_mono)
+
+            duration_ground_truth = alignment_attn_mono.sum(axis=-1).detach()
+
+            # Extract style features for validation
+            utterance_prosodic_style, _ = extract_style_features(model, mels, mel_input_length)
+            
+            bert_embeddings = model.bert(bert_texts, attention_mask=(~text_mask).int())
+            bert_encoded = model.bert_encoder(bert_embeddings).transpose(-1, -2) 
+            duration_pred, predictor_features = model.predictor(bert_encoded, utterance_prosodic_style, input_lengths, alignment_attn_mono, text_mask)
+
+            # Create random segments for training
+            encoder_segments, predictor_segments, mel_targets_segments, waveforms_segments = create_random_segments(
+                mel_input_length=mel_input_length,
+                aligned_encoded_text=aligned_encoded_text,
+                predictor_features=predictor_features,
+                mels=mels,
+                waves=waves,
+                device=device,
+                max_len=max_len
+            )
+            
+            if mel_targets_segments.size(-1) < 80:
+                continue
+
+            segment_prosodic_style = model.predictor_encoder(mel_targets_segments)
+            F0_fake, N_fake = model.predictor.F0Ntrain(predictor_segments, segment_prosodic_style)
+            _, loss_dur = calculate_duration_and_ce_losses(duration_pred, duration_ground_truth, input_lengths)
+            
+            segment_acoustic_style = model.style_encoder(mel_targets_segments)
+            decoder_pred_prosody_pred = model.decoder(encoder_segments, F0_fake, N_fake, segment_acoustic_style)
+            loss_mel = stft_loss(decoder_pred_prosody_pred.squeeze(), waveforms_segments)
+
+            F0_real, _, F0 = model.pitch_extractor(mel_targets_segments) 
+
+            loss_F0 = F.l1_loss(F0_real, F0_fake) / 10
+
+            loss_test += (loss_mel).mean()
+            loss_align += (loss_dur).mean()
+            loss_f += (loss_F0).mean()
+
+            iters_test += 1
+
+    # Calculate average losses
+    avg_mel_loss = loss_test / iters_test
+    avg_dur_loss = loss_align / iters_test
+    avg_f0_loss = loss_f / iters_test
+
+    # Log metrics to wandb
+    wandb.log({
+        "eval/Mel Reconstruction Loss": avg_mel_loss,
+        "eval/Duration Loss": avg_dur_loss,
+        "eval/F0 Loss": avg_f0_loss,
+        "epoch": epoch + 1
+    })
+
+    return avg_mel_loss
+
+def save_checkpoint(model, optimizer, epoch, iters, loss_test, best_loss, log_dir, 
+                   config=None, config_path=None, model_params=None, running_std=None):
+    """
+    Save model checkpoint and optionally update config with new sigma data.
+    
+    Args:
+        model: Dictionary of model components
+        optimizer: Model optimizer
+        epoch: Current epoch number
+        iters: Current iteration count
+        loss_test: Current validation loss
+        best_loss: Best validation loss so far
+        save_freq: How often to save checkpoints
+        log_dir: Directory to save checkpoints
+        config: Optional config dictionary
+        config_path: Optional path to config file
+        model_params: Optional model parameters
+        running_std: Optional running standard deviation for sigma estimation
+    """
+    if loss_test < best_loss:
+        best_loss = loss_test
+        
+    # Save model checkpoint
+    state = {
+        'net': {key: model[key].state_dict() for key in model},
+        'optimizer': optimizer.state_dict(),
+        'iters': iters,
+        'val_loss': loss_test,
+        'epoch': epoch,
+    }
+    save_path = osp.join(log_dir, f'epoch_{epoch:05d}.pth')
+    print(f'Saving to {save_path}')
+    torch.save(state, save_path)
+
+    # Update config with new sigma data if needed
+    if (config is not None and config_path is not None and 
+        model_params is not None and running_std is not None and 
+        model_params.diffusion.dist.estimate_sigma_data):
+        
+        config['model_params']['diffusion']['dist']['sigma_data'] = float(np.mean(running_std))
+
+        with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
+            yaml.dump(config, outfile, default_flow_style=True)
+
+    return best_loss
+
 # @click.command()
 # @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(args = None):
@@ -380,7 +526,6 @@ def main(args = None):
     batch_size = config['batch_size']
 
     epochs = config['epochs']
-    save_freq = config['save_freq']
     log_interval = config['log_interval']
 
     data_params = config['data_params']
@@ -457,6 +602,9 @@ def main(args = None):
 
     torch.cuda.empty_cache()
     for epoch in range(start_epoch, epochs):
+        loss_test = validate_model(model, val_dataloader, optimizer, device, n_down, max_len, stft_loss, epoch)
+        best_loss = save_checkpoint(model, optimizer, epoch, iters, loss_test, best_loss, log_dir, config, config_path, model_params, running_std)
+
         running_loss = 0
 
         _ = [model[key].eval() for key in model]
@@ -627,108 +775,6 @@ def main(args = None):
                 })
                 
                 running_loss = 0
-                
-        loss_test = 0
-        loss_align = 0
-        loss_f = 0
-        _ = [model[key].eval() for key in model]
 
-        with torch.no_grad():
-            iters_test = 0
-            for _, batch in enumerate(val_dataloader):
-                optimizer.zero_grad()
-
-                try:
-                    waves, texts, bert_texts, input_lengths, mels, mel_input_length, ref_mels = batch
-                    _ = [b.to(device) for b in batch[1:]]
-
-                    if mels.size(-1) < 80:
-                        continue
-
-                    mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
-                    text_mask = length_to_mask(input_lengths).to(device)
-
-                    alignment_logits, alignment_attn = perform_text_alignment(model, mels, mask, texts)
-
-                    mask_ST = mask_from_lens(alignment_attn, input_lengths, mel_input_length // (2 ** n_down))
-                    alignment_attn_mono = maximum_path(alignment_attn, mask_ST)
-
-                    # encode
-                    text_encoded = model.text_encoder(texts, input_lengths, text_mask)
-                    aligned_encoded_text = (text_encoded @ alignment_attn_mono)
-
-                    duration_ground_truth = alignment_attn_mono.sum(axis=-1).detach()
-
-                    # Extract style features for validation
-                    utterance_prosodic_style, _ = extract_style_features(model, mels, mel_input_length)
-                    
-                    bert_embeddings = model.bert(bert_texts, attention_mask=(~text_mask).int())
-                    bert_encoded = model.bert_encoder(bert_embeddings).transpose(-1, -2) 
-                    duration_pred, predictor_features = model.predictor(bert_encoded, utterance_prosodic_style, input_lengths, alignment_attn_mono, text_mask)
-
-                    # Create random segments for training
-                    encoder_segments, predictor_segments, mel_targets_segments, waveforms_segments = create_random_segments(
-                        mel_input_length=mel_input_length,
-                        aligned_encoded_text=aligned_encoded_text,
-                        predictor_features=predictor_features,
-                        mels=mels,
-                        waves=waves,
-                        device=device,
-                        max_len=max_len
-                    )
-                    
-                    if mel_targets_segments.size(-1) < 80:
-                        continue
-
-                    segment_prosodic_style = model.predictor_encoder(mel_targets_segments)
-                    F0_fake, N_fake = model.predictor.F0Ntrain(predictor_segments, segment_prosodic_style)
-                    _, loss_dur = calculate_duration_and_ce_losses(duration_pred, duration_ground_truth, input_lengths)
-                    
-                    segment_acoustic_style = model.style_encoder(mel_targets_segments)
-                    decoder_pred_prosody_pred = model.decoder(encoder_segments, F0_fake, N_fake, segment_acoustic_style)
-                    loss_mel = stft_loss(decoder_pred_prosody_pred.squeeze(), waveforms_segments)
-
-                    F0_real, _, F0 = model.pitch_extractor(mel_targets_segments) 
-
-                    loss_F0 = F.l1_loss(F0_real, F0_fake) / 10
-
-                    loss_test += (loss_mel).mean()
-                    loss_align += (loss_dur).mean()
-                    loss_f += (loss_F0).mean()
-
-                    iters_test += 1
-                except:
-                    continue
-        
-        # Log metrics to wandb
-        wandb.log({
-            "eval/Mel Reconstruction Loss": loss_test / iters_test,
-            "eval/Duration Loss": loss_align / iters_test,
-            "eval/F0 Loss": loss_f / iters_test,
-            "epoch": epoch + 1
-        })
-
-        if (epoch + 1) % save_freq == 0 :
-            if (loss_test / iters_test) < best_loss:
-                best_loss = loss_test / iters_test
-            state = {
-                'net':  {key: model[key].state_dict() for key in model}, 
-                'optimizer': optimizer.state_dict(),
-                'iters': iters,
-                'val_loss': loss_test / iters_test,
-                'epoch': epoch,
-            }
-            save_path = osp.join(log_dir, 'epoch_%05d.pth' % epoch)
-            print(f'Saving to {save_path}')
-            torch.save(state, save_path)
-
-            # if estimate sigma, save the estimated simga
-            if model_params.diffusion.dist.estimate_sigma_data:
-                config['model_params']['diffusion']['dist']['sigma_data'] = float(np.mean(running_std))
-
-                with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
-                    yaml.dump(config, outfile, default_flow_style=True)
-
-                            
 if __name__=="__main__":
     main()

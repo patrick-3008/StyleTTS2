@@ -35,7 +35,7 @@ hf_cache_volume = modal.Volume.from_name("hf_cache", create_if_missing=True)
 @app.function(
     volumes={"/style_tts2": style_tts2_volume, "/hf_cache": hf_cache_volume},
     secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("huggingface-secret")],
-    gpu="A100-80GB",
+    gpu="H100",
     timeout = 86400)
 def train_main():
     _ = track_restarts(restart_tracker_dict)
