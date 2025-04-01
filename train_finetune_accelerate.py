@@ -25,7 +25,7 @@ from optimizers import build_optimizer
 
 from accelerate import Accelerator
 
-accelerator = Accelerator()
+accelerator = Accelerator(mixed_precision="fp16")
 
 # simple fix for dataparallel that allows access to class attributes
 class AttributeForwardingDataParallel(torch.nn.DataParallel):
@@ -357,9 +357,11 @@ def extract_style_features(model, mels, mel_input_lengths):
     
     return prosodic_features, acoustic_features
 
-@click.command()
-@click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
-def main(config_path):
+# @click.command()
+# @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
+def main(args = None):
+    assert args is not None, "args must be provided"
+    config_path = args['config_path']
     config = yaml.safe_load(open(config_path))
     
     log_dir = config['log_dir']
@@ -367,7 +369,7 @@ def main(config_path):
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
     
     # Initialize wandb
-    wandb.init(project="finetune_youtube", config=config)
+    wandb.init(project=args['run_name'], config=config)
 
     # write logs
     file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))

@@ -11,8 +11,6 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-import pandas as pd
-
 from char_indexer import VanillaCharacterIndexer, BertCharacterIndexer
 
 np.random.seed(1)
