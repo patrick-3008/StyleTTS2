@@ -14,4 +14,6 @@ einops-exts
 tqdm
 typing
 typing-extensions
+wandb
+datasets
 git+https://github.com/resemble-ai/monotonic_align.git
