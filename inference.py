@@ -189,7 +189,7 @@ print(phonemes)
 noise = torch.randn(1,1,256).to(device)
 ref_s = compute_style(ref_audio)
 start = time.time()
-wav = inference(phonemes, ref_s, alpha=0.3, beta=0.0, diffusion_steps=5, embedding_scale=1)
+wav = inference(phonemes, ref_s, alpha=0.3, beta=0.7, diffusion_steps=5, embedding_scale=1)
 rtf = (time.time() - start) / (len(wav) / 24000)
 print(f"RTF = {rtf:5f}")
 
