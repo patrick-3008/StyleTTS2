@@ -57,7 +57,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # load phonemizer
 global_phonemizer = phonemizer.backend.EspeakBackend(language='ar',preserve_punctuation=True, with_stress=True)
-config = yaml.safe_load(open("Configs/config_ft.yml"))
+config = yaml.safe_load(open("config.yml"))
 
 F0_path = "Utils/JDC/bst.t7"
 ASR_config =  "Utils/ASR/config.yml"
@@ -78,7 +78,7 @@ model = build_model(model_params, text_aligner, pitch_extractor, plbert)
 _ = [model[key].eval() for key in model]
 _ = [model[key].to(device) for key in model]
 
-state = torch.load("epoch_00019.pth", map_location='cpu')
+state = torch.load("model.pth", map_location='cpu')
 
 params = state['net']
 
