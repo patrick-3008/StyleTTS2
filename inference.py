@@ -14,6 +14,7 @@ from utils import recursive_munch
 from char_indexer import BertCharacterIndexer, VanillaCharacterIndexer
 from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
 import warnings
+import os
 
 # Configure logging
 logging.basicConfig(
@@ -43,12 +44,25 @@ def parse_arguments():
 
 def set_seeds(seed=0):
     """Set seeds for reproducibility."""
-    torch.manual_seed(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    # Python's built-in random
     random.seed(seed)
+    
+    # NumPy
     np.random.seed(seed)
-    logger.debug(f"Random seeds set to {seed}")
+    
+    # PyTorch
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)        # for current GPU
+    torch.cuda.manual_seed_all(seed)    # for all GPUs
+    
+    # CUDA deterministic behavior
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Environment variables (some CUDA operations use these)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    logger.debug(f"Random seeds set to {seed} across all libraries")
 
 def length_to_mask(lengths):
     """Convert lengths tensor to mask tensor."""
@@ -110,7 +124,8 @@ def load_model_weights(model, model_path, device):
                 state_dict = params[key]
                 new_state_dict = OrderedDict()
                 for k, v in state_dict.items():
-                    name = k[7:] if k.startswith('module.') else k  # remove `module.` prefix
+                    # Remove 'module.' prefix if present, regardless of prefix length
+                    name = k.replace('module.', '') if k.startswith('module.') else k
                     new_state_dict[name] = v
                 model[key].load_state_dict(new_state_dict, strict=False)
     
