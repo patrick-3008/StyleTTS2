@@ -2,6 +2,7 @@ SoundFile
 torchaudio
 munch
 torch
+phonemizer
 pydub
 pyyaml
 librosa

@@ -23,7 +23,6 @@ def _load_plbert(config_path, model_path):
     albert_base_configuration = AlbertConfig(**plbert_config['model_params'], vocab_size=len(symbols))
     bert = CustomAlbert(albert_base_configuration)
 
-    print(f"Loading checkpoint from: {model_path}")
     checkpoint = torch.load(model_path, map_location='cpu')
     state_dict = checkpoint['net']
     from collections import OrderedDict
