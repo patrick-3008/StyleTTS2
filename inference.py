@@ -5,12 +5,20 @@ import numpy as np
 import torch
 import torchaudio
 import phonemizer
+import argparse
 from scipy.io.wavfile import write as write_wav
 from collections import OrderedDict
-from models import *
-from utils import *
+from models import load_ASR_models, load_F0_models, build_model
+from utils import recursive_munch
 from char_indexer import BertCharacterIndexer, VanillaCharacterIndexer
 from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description='StyleTTS2 Inference')
+parser.add_argument('--config', type=str, default="config.yml", help='Path to config file')
+parser.add_argument('--model', type=str, default="model.pth", help='Path to model file')
+parser.add_argument('--text', type=str, help='Arabic text to synthesize', default="الإِتْقَانُ يَحْتَاجُ إِلَى الْعَمَلِ وَالْمُثَابَرَةِ.")
+args = parser.parse_args()
 
 # Set seeds for reproducibility
 torch.manual_seed(0)
@@ -40,7 +48,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # load phonemizer
 global_phonemizer = phonemizer.backend.EspeakBackend(language='ar',preserve_punctuation=True, with_stress=True)
-config = yaml.safe_load(open("config.yml"))
+config = yaml.safe_load(open(args.config))
 
 F0_path = "Utils/JDC/bst.t7"
 ASR_config =  "Utils/ASR/config.yml"
@@ -61,7 +69,7 @@ model = build_model(model_params, text_aligner, pitch_extractor, plbert)
 _ = [model[key].eval() for key in model]
 _ = [model[key].to(device) for key in model]
 
-state = torch.load("model.pth", map_location='cpu')
+state = torch.load(args.model, map_location='cpu')
 
 params = state['net']
 
@@ -152,13 +160,12 @@ def inference(phonemes, diffusion_steps=5, embedding_scale=1):
     return out.squeeze().cpu().numpy()[..., :-50] # weird pulse at the end of the model, need to be fixed late
 
 # Generate a short diacritized Arabic sentence about mastery requiring work
-arabic_sentence = "الإِتْقَانُ يَحْتَاجُ إِلَى الْكَثِيرِ مِنَ الْعَمَلِ وَالْمُثَابَرَةِ، فَلَا يُمْكِنُ تَحْقِيقُ النَّجَاحِ دُونَ بَذْلِ الْجُهْدِ الْمُتَوَاصِلِ. وَكَمَا يَقُولُ الْحُكَمَاءُ: إِنَّ الطَّرِيقَ إِلَى التَّمَيُّزِ مَلِيءٌ بِالتَّحَدِّيَاتِ، وَلَكِنَّ ثِمَارَهُ حَلْوَةٌ لِمَنْ صَبَرَ وَاجْتَهَدَ."
 
 print("Arabic sentence:")
-print(arabic_sentence)
+print(args.text)
 
 # Phonemize the Arabic sentence
-phonemes = global_phonemizer.phonemize([arabic_sentence])[0]
+phonemes = global_phonemizer.phonemize([args.text])[0]
 
 print("\nPhonemized text:")
 print(phonemes)
