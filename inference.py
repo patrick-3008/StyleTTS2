@@ -1,15 +1,12 @@
-import os
 import random
 import time
 import yaml
 import numpy as np
 import torch
 import torchaudio
-import librosa
 import phonemizer
 from scipy.io.wavfile import write as write_wav
 from collections import OrderedDict
-from datasets import load_dataset
 from models import *
 from utils import *
 from char_indexer import BertCharacterIndexer, VanillaCharacterIndexer
@@ -23,9 +20,6 @@ random.seed(0)
 np.random.seed(0)
 
 # Set the HF_HOME environment variable to the path of the Hugging Face cache directory
-# os.environ['HF_HOME'] = "/mnt/huggingface"
-
-audiobook_dataset = load_dataset("fadi77/arabic-audiobook-dataset-24khz", split="train")
 
 to_mel = torchaudio.transforms.MelSpectrogram(
     n_mels=80, n_fft=2048, win_length=1200, hop_length=300)
@@ -41,17 +35,6 @@ def preprocess(wave):
     mel_tensor = to_mel(wave_tensor)
     mel_tensor = (torch.log(1e-5 + mel_tensor.unsqueeze(0)) - mean) / std
     return mel_tensor
-
-def compute_style(audio):
-    audio, index = librosa.effects.trim(audio, top_db=30)
-    audio = audio.squeeze()
-    mel_tensor = preprocess(audio).to(device)
-
-    with torch.no_grad():
-        ref_s = model.style_encoder(mel_tensor.unsqueeze(1))
-        ref_p = model.predictor_encoder(mel_tensor.unsqueeze(1))
-
-    return torch.cat([ref_s, ref_p], dim=1)
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -105,7 +88,7 @@ sampler = DiffusionSampler(
     clamp=False
 )
 
-def inference(phonemes, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1):
+def inference(phonemes, diffusion_steps=5, embedding_scale=1):
     tokens = VanillaCharacterIndexer()(phonemes)
     bert_tokens = BertCharacterIndexer()(phonemes)
     tokens.insert(0, 0); bert_tokens.insert(0, 0)
@@ -120,21 +103,17 @@ def inference(phonemes, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embed
         bert_dur = model.bert(bert_tokens, attention_mask=(~text_mask).int())
         d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-        s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(device),
-                                          embedding=bert_dur,
-                                          embedding_scale=embedding_scale,
-                                            features=ref_s, # reference from the same speaker as the embedding
-                                             num_steps=diffusion_steps).squeeze(1)
+        s_pred = sampler(
+            noise = torch.randn((1, 256)).unsqueeze(1).to(device),
+            embedding=bert_dur,
+            embedding_scale=embedding_scale,
+            num_steps=diffusion_steps).squeeze(1)
 
 
         s = s_pred[:, 128:]
         ref = s_pred[:, :128]
 
-        ref = alpha * ref + (1 - alpha)  * ref_s[:, :128]
-        s = beta * s + (1 - beta)  * ref_s[:, 128:]
-
-        d = model.predictor.text_encoder(d_en,
-                                         s, input_lengths, text_mask)
+        d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
 
         x, _ = model.predictor.lstm(d)
         duration = model.predictor.duration_proj(x)
@@ -172,8 +151,6 @@ def inference(phonemes, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embed
 
     return out.squeeze().cpu().numpy()[..., :-50] # weird pulse at the end of the model, need to be fixed late
 
-ref_audio = np.array(audiobook_dataset[100]['audio'])
-
 # Generate a short diacritized Arabic sentence about mastery requiring work
 arabic_sentence = "الإِتْقَانُ يَحْتَاجُ إِلَى الْكَثِيرِ مِنَ الْعَمَلِ وَالْمُثَابَرَةِ، فَلَا يُمْكِنُ تَحْقِيقُ النَّجَاحِ دُونَ بَذْلِ الْجُهْدِ الْمُتَوَاصِلِ. وَكَمَا يَقُولُ الْحُكَمَاءُ: إِنَّ الطَّرِيقَ إِلَى التَّمَيُّزِ مَلِيءٌ بِالتَّحَدِّيَاتِ، وَلَكِنَّ ثِمَارَهُ حَلْوَةٌ لِمَنْ صَبَرَ وَاجْتَهَدَ."
 
@@ -187,9 +164,8 @@ print("\nPhonemized text:")
 print(phonemes)
 
 noise = torch.randn(1,1,256).to(device)
-ref_s = compute_style(ref_audio)
 start = time.time()
-wav = inference(phonemes, ref_s, alpha=0.3, beta=0.7, diffusion_steps=5, embedding_scale=1)
+wav = inference(phonemes, diffusion_steps=5, embedding_scale=1)
 rtf = (time.time() - start) / (len(wav) / 24000)
 print(f"RTF = {rtf:5f}")
 
