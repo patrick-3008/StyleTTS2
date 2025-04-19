@@ -39,15 +39,15 @@ def _load_plbert(config_path, model_path):
 
 def load_plbert(repo_id, dirname):
     config_path = hf_hub_download(
-        repo_id=repo_id,       # or e.g. "stabilityai/stable-diffusion-2"
+        repo_id=repo_id,
         filename=f"{dirname}/config.yml",
-        repo_type="model",                       # or "dataset", or "space"
+        repo_type="model", 
     )
     
     model_path = hf_hub_download(
-        repo_id=repo_id,       # or e.g. "stabilityai/stable-diffusion-2"
+        repo_id=repo_id,
         filename=f"{dirname}/model.pth",
-        repo_type="model",                       # or "dataset", or "space"
+        repo_type="model",
     )
 
     return _load_plbert(config_path, model_path)
