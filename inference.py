@@ -13,6 +13,7 @@ from models import load_ASR_models, load_F0_models, build_model
 from utils import recursive_munch
 from char_indexer import BertCharacterIndexer, VanillaCharacterIndexer
 from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
+import warnings
 
 # Configure logging
 logging.basicConfig(
@@ -21,6 +22,8 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger('StyleTTS2')
+
+warnings.filterwarnings("ignore", message="dropout option adds dropout after all but last recurrent layer")
 
 def parse_arguments():
     """Parse command line arguments for StyleTTS2 inference."""
