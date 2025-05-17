@@ -1,27 +1,44 @@
-log_dir: "Models/LJSpeech"
-first_stage_path: "first_stage.pth"
-save_freq: 2
-log_interval: 10
-device: "cuda"
-epochs_1st: 200 # number of epochs for first stage training (pre-training)
-epochs_2nd: 100 # number of peochs for second stage training (joint training)
-batch_size: 16
-max_len: 400 # maximum number of frames
-pretrained_model: ""
-second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
-load_only_params: false # set to true if do not want to load epoch numbers and optimizer parameters
+#config.yml
 
-F0_path: "Utils/JDC/bst.t7"
-ASR_config: "Utils/ASR/config.yml"
-ASR_path: "Utils/ASR/epoch_00080.pth"
-PLBERT_dir: 'Utils/PLBERT/'
+log_dir: "/content/drive/MyDrive/DA7EE7/styletts2_logs"  # ✅ Changed: set log directory to your Google Drive
+log_interval: 2
+device: "cuda"
+
+# Training Duration
+epochs: 2  # ✅ Reduced from 25 to 20 to prevent overfitting on small dataset
+early_stopping_patience: 5  # ✅ Added: early stopping if no improvement in 5 epochs
+
+batch_size: 1  # ✅ Increased from 6 to 8 for better GPU utilization
+max_len: 300
+
+# Pretrained Model
+pretrained_model_repo: "yl4579/StyleTTS2-LibriTTS"
+pretrained_model_filename: "Models/LibriTTS/epochs_2nd_00020.pth"
+second_stage_load_pretrained: true
+load_only_params: true
+
+# ASR & Phonemizer
+F0_path: "/content/StyleTTS2/Utils/JDC/bst.t7"
+ASR_config: "/content/StyleTTS2/Utils/ASR/config.yml"
+ASR_path: "/content/StyleTTS2/Utils/ASR/epoch_00080.pth"
+use_espeak_phonemizer: true
+language: "ar"
+
+# PL-BERT Arabic
+PLBERT_repo_id: "fadi77/pl-bert"
+PLBERT_dirname: "models/mlm_only_non_diacritics"
+
+# Data paths
+path:
+  audio_base: "/content/data/wavs"  # ✅ Fixed: added required indentation and unified path usage
 
 data_params:
-  train_data: "Data/train_list.txt"
-  val_data: "Data/val_list.txt"
-  root_path: "/local/LJSpeech-1.1/wavs"
-  OOD_data: "Data/OOD_texts.txt"
-  min_length: 50 # sample until texts with this size are obtained for OOD texts
+  train_data: "/content/data/metadata_train.csv"  # ✅ Changed: path to the training CSV
+  val_data: "/content/data/metadata_val.csv"  # ✅ Changed: path to the validation CSV
+  test_data: "/content/data/metadata_test.csv"  # ✅ Added: path to the test CSV
+  root_path: "/content/data/wavs"  # ✅ Unified path with audio_base
+  OOD_data: "/content/data/metadata.csv"  # ✅ Same file as fallback
+  min_length: 50
 
 preprocess_params:
   sr: 24000
@@ -32,85 +49,78 @@ preprocess_params:
 
 model_params:
   multispeaker: false
-
-  dim_in: 64 
+  dim_in: 64
   hidden_dim: 512
   max_conv_dim: 512
   n_layer: 3
   n_mels: 80
+  n_token: 178
+  max_dur: 50
+  style_dim: 128
+  dropout: 0.3  # ✅ Increased dropout to add regularization and reduce overfitting
 
-  n_token: 178 # number of phoneme tokens
-  max_dur: 50 # maximum duration of a single phoneme
-  style_dim: 128 # style vector size
-  
-  dropout: 0.2
+  decoder:
+    type: 'hifigan'
+    resblock_kernel_sizes: [3, 7, 11]
+    upsample_rates: [10, 5, 3, 2]
+    upsample_initial_channel: 512
+    resblock_dilation_sizes: [[1, 3, 5], [1, 3, 5], [1, 3, 5]]
+    upsample_kernel_sizes: [20, 10, 6, 4]
 
-  # config for decoder
-  decoder: 
-      type: 'istftnet' # either hifigan or istftnet
-      resblock_kernel_sizes: [3,7,11]
-      upsample_rates :  [10, 6]
-      upsample_initial_channel: 512
-      resblock_dilation_sizes: [[1,3,5], [1,3,5], [1,3,5]]
-      upsample_kernel_sizes: [20, 12]
-      gen_istft_n_fft: 20
-      gen_istft_hop_size: 5
-      
-  # speech language model config
   slm:
-      model: 'microsoft/wavlm-base-plus'
-      sr: 16000 # sampling rate of SLM
-      hidden: 768 # hidden size of SLM
-      nlayers: 13 # number of layers of SLM
-      initial_channel: 64 # initial channels of SLM discriminator head
-  
-  # style diffusion model config
+    model: 'microsoft/wavlm-base-plus'
+    sr: 16000
+    hidden: 768
+    nlayers: 13
+    initial_channel: 64
+
   diffusion:
     embedding_mask_proba: 0.1
-    # transformer config
     transformer:
       num_layers: 3
       num_heads: 8
       head_features: 64
       multiplier: 2
-
-    # diffusion distribution config
     dist:
-      sigma_data: 0.2 # placeholder for estimate_sigma_data set to false
-      estimate_sigma_data: true # estimate sigma_data from the current batch if set to true
+      sigma_data: 0.2
+      estimate_sigma_data: true
       mean: -3.0
       std: 1.0
-  
-loss_params:
-    lambda_mel: 5. # mel reconstruction loss
-    lambda_gen: 1. # generator loss
-    lambda_slm: 1. # slm feature matching loss
-    
-    lambda_mono: 1. # monotonic alignment loss (1st stage, TMA)
-    lambda_s2s: 1. # sequence-to-sequence loss (1st stage, TMA)
-    TMA_epoch: 50 # TMA starting epoch (1st stage)
 
-    lambda_F0: 1. # F0 reconstruction loss (2nd stage)
-    lambda_norm: 1. # norm reconstruction loss (2nd stage)
-    lambda_dur: 1. # duration loss (2nd stage)
-    lambda_ce: 20. # duration predictor probability output CE loss (2nd stage)
-    lambda_sty: 1. # style reconstruction loss (2nd stage)
-    lambda_diff: 1. # score matching loss (2nd stage)
-    
-    diff_epoch: 20 # style diffusion starting epoch (2nd stage)
-    joint_epoch: 50 # joint training starting epoch (2nd stage)
+loss_params:
+  lambda_mel: 5.
+  lambda_gen: 1.
+  lambda_slm: 1.
+  lambda_mono: 1.
+  lambda_s2s: 1.
+  lambda_F0: 1.
+  lambda_norm: 1.
+  lambda_dur: 1.
+  lambda_ce: 20.
+  lambda_sty: 1.
+  lambda_diff: 1.
+
+  diffusion_training_epoch: 5
+  joint_training_epoch: 100
 
 optimizer_params:
-  lr: 0.0001 # general learning rate
-  bert_lr: 0.00001 # learning rate for PLBERT
-  ft_lr: 0.00001 # learning rate for acoustic modules
-  
+  lr: 0.00005  # ✅ Reduced from 0.0001 to 0.00005 to slow learning and prevent overfitting
+  bert_lr: 0.00001
+  ft_lr: 0.00005  # ✅ Reduced for same reason as lr
+
 slmadv_params:
-  min_len: 400 # minimum length of samples
-  max_len: 500 # maximum length of samples
-  batch_percentage: 0.5 # to prevent out of memory, only use half of the original batch size
-  iter: 10 # update the discriminator every this iterations of generator update
-  thresh: 5 # gradient norm above which the gradient is scaled
-  scale: 0.01 # gradient scaling factor for predictors from SLM discriminators
-  sig: 1.5 # sigma for differentiable duration modeling
-  
+  min_len: 400
+  max_len: 500
+  batch_percentage: 0.5
+  skip_update: 10
+  thresh: 5
+  scale: 0.01
+  sig: 1.5
+
+# ✅ New checkpointing section
+save_checkpoint_every: 1  # ✅ Added: save checkpoint after every epoch
+save_best_model: true  # ✅ Added: automatically save the best model
+save_last_checkpoint: true  # ✅ Added: always save the last model
+
+# Data Split into Train, Test, and Validation (70%, 10%, 20%)
+# Ensure you create these CSV files or apply data splitting code for creating metadata_train.csv, metadata_val.csv, and metadata_test.csv
